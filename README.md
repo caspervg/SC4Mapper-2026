@@ -69,6 +69,15 @@ artifact. macOS and Linux builds are attempted on native runners and attached
 when they succeed, but they should be treated as experimental until the app
 behavior and wxPython packaging have been tested on those platforms.
 
+### macOS
+
+The app is distributed as a signed `.app` bundle (but without Apple Developer certificate).
+After unzipping, remove the quarantine flag once before launching:
+
+```sh
+xattr -rd com.apple.quarantine SC4Mapper.app
+```
+
 ## Repository Layout
 
 - `src/sc4mapper/` - application code
