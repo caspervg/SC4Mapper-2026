@@ -14,3 +14,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 codex_tmp/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
