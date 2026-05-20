@@ -1,3 +1,5 @@
 """SC4Mapper package."""
 
-__version__ = "2025.0"
+from .version import get_version
+
+__version__ = get_version()

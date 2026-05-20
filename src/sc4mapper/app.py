@@ -21,6 +21,7 @@ from . import settings as appsettings
 from . import terrain
 from . import zip_utils
 from .resources import asset_path
+from .version import get_version
 
 # Sanity check: make sure the (now pure-Python) terrain backend is the one we
 # expect.  The original guarded against a stale compiled DLL; terrain is now a
@@ -45,7 +46,7 @@ except Exception:
     sys.exit()
 
 
-MAPPER_VERSION = "2025.0"
+MAPPER_VERSION = get_version()
 SCROLL_RATE = 1
 
 
