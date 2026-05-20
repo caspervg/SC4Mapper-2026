@@ -73,7 +73,7 @@ class ModalQuestion(wx.Dialog):
         self.Fit()
 
 
-def questionDialog(message, buttons=[wx.ID_OK, wx.ID_CANCEL], caption=''):
+def ask_question(message, buttons=[wx.ID_OK, wx.ID_CANCEL], caption=''):
     """Ask a question and return the button the user clicked.
 
     Allowable button specifications are strings or wx IDs of stock buttons.

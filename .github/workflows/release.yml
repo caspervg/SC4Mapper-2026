@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate-tag:
+    name: Validate Release Tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate version tag
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]{4}\.[0-9]+[a-z]$ ]]; then
+            echo "Release tags must match vYYYY.Nsuffix, for example v2026.1a. Got: $TAG_NAME"
+            exit 1
+          fi
+
+  package:
+    name: Package ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.os }}
+    needs: validate-tag
+    continue-on-error: ${{ matrix.platform.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Windows
+            os: windows-latest
+            archive: SC4Mapper-windows-x64.zip
+            experimental: false
+          - name: macOS
+            os: macos-latest
+            archive: SC4Mapper-macos-arm64.zip
+            experimental: true
+          - name: Linux
+            os: ubuntu-latest
+            archive: SC4Mapper-linux-x64.tar.gz
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-0 libnotify4 libsdl2-2.0-0 libwebkit2gtk-4.1-0
+
+      - name: Run tests
+        if: runner.os == 'Windows'
+        run: uv run --python 3.12 --group dev pytest
+
+      - name: Build executable
+        run: uv run --python 3.12 --group build pyinstaller --clean --noconfirm SC4Mapper.spec
+
+      - name: Add user config
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item -Recurse -Force config dist/SC4Mapper/config
+
+      - name: Add user config
+        if: runner.os != 'Windows'
+        run: cp -R config dist/SC4Mapper/config
+
+      - name: Create Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/SC4Mapper -DestinationPath "${{ matrix.platform.archive }}"
+
+      - name: Create macOS archive
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/SC4Mapper "${{ matrix.platform.archive }}"
+
+      - name: Create Linux archive
+        if: runner.os == 'Linux'
+        run: tar -czf "${{ matrix.platform.archive }}" -C dist SC4Mapper
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform.archive }}
+          path: ${{ matrix.platform.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: package
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: SC4Mapper-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" release-artifacts/* \
+            --title "$TAG_NAME" \
+            --notes "Automated SC4Mapper build for $TAG_NAME."

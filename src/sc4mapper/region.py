@@ -11,12 +11,12 @@ import numpy as Numeric
 import wx
 from PIL import Image, ImageDraw
 
-from . import GradientReader
+from . import gradient
 from . import qfs as QFS
 from . import settings
-from . import tools3d as tools3D
+from . import terrain as terrain
 from .resources import asset_path
-from .utils import encodeFilename
+from .filename_utils import encode_filename
 
 generic_saveValue = 3
 COMPRESSED_SIG = 0xFB10
@@ -35,9 +35,9 @@ def Normalize(p1):
 
 def ComputeOneRGB(bLight, height, waterLevel, region):
     lightDir = Normalize((1, -5, -1))
-    rawRGB = tools3D.onePassColors(bLight, height.shape, waterLevel, height,
-                                   GradientReader.paletteWater,
-                                   GradientReader.paletteLand, lightDir)
+    rawRGB = terrain.onePassColors(bLight, height.shape, waterLevel, height,
+                                   gradient.paletteWater,
+                                   gradient.paletteLand, lightDir)
     rgb = Numeric.frombuffer(rawRGB, Numeric.int8)
     rgb = Numeric.reshape(rgb, (height.shape[0], height.shape[1], 3))
     return rgb
@@ -263,7 +263,7 @@ def Save(city, folder, color, waterLevel):
 def BuildThumbnail(city, colors, waterLevel):
     """Build the region-view images (normal and alpha)."""
     n = os.path.splitext(city.fileName)[0]
-    minx, miny, maxx, maxy, r = tools3D.generateImage(
+    minx, miny, maxx, maxy, r = terrain.generateImage(
         waterLevel, city.heightMap.shape, city.heightMap.tobytes(), colors)
     maxx += 2
     offset = len(r) // 2
@@ -520,7 +520,7 @@ class SC4Region(object):
                                 if os.path.splitext(x)[1] == ".sc4"]
             try:
                 self.config = Image.open(
-                    encodeFilename(os.path.join(folder, "config.bmp")))
+                    encode_filename(os.path.join(folder, "config.bmp")))
             except Exception:
                 self.config = None
         self.allCities = []
@@ -686,10 +686,10 @@ class SC4Region(object):
             citySave.heightMap = (citySave.heightMap.astype(Numeric.float32)
                                   / Numeric.asarray(10, Numeric.float32))
             lightDir = Normalize((1, -5, -1))
-            rawRGB = tools3D.onePassColors(False, citySave.heightMap.shape,
+            rawRGB = terrain.onePassColors(False, citySave.heightMap.shape,
                                            self.waterLevel, citySave.heightMap,
-                                           GradientReader.paletteWater,
-                                           GradientReader.paletteLand, lightDir)
+                                           gradient.paletteWater,
+                                           gradient.paletteLand, lightDir)
             try:
                 if not Save(citySave, self.folder, rawRGB, self.waterLevel):
                     saved = False
@@ -739,7 +739,7 @@ class SC4Region(object):
 def LoadGradient(path=None):
     if path is None:
         path = settings.load().config_file
-    GradientReader.Init(str(path))
+    gradient.Init(str(path))
 
 
 LoadGradient()

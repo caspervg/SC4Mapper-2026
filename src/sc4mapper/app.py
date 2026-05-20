@@ -14,26 +14,26 @@ import wx.adv
 import wx.lib.masked as masked
 from PIL import Image, ImageDraw
 
-from . import about
-from . import QuestionDialog
-from . import rgnReader
+from . import about_dialog
+from . import dialogs
+from . import region
 from . import settings as appsettings
-from . import tools3d as tools3D
-from . import zipUtils
+from . import terrain
+from . import zip_utils
 from .resources import asset_path
 
-# Sanity check: make sure the (now pure-Python) tools3D backend is the one we
-# expect.  The original guarded against a stale compiled DLL; tools3D is now a
+# Sanity check: make sure the (now pure-Python) terrain backend is the one we
+# expect.  The original guarded against a stale compiled DLL; terrain is now a
 # pure-Python module, so a mismatch means a broken or outdated install.
 try:
-    version = tools3D.GetVersion()
+    version = terrain.GetVersion()
     if version != "v1.0d":
         raise ValueError
 except Exception:
     class ErrApp(wx.App):
         def OnInit(self):
             dlg = wx.MessageDialog(
-                None, "The tools3d backend module is missing or out of date.\n"
+                None, "The terrain backend module is missing or out of date.\n"
                 "Please reinstall SC4Mapper.",
                 'Error', wx.OK | wx.ICON_ERROR)
             dlg.ShowModal()
@@ -288,13 +288,13 @@ class OverViewCanvas(wx.ScrolledWindow):
         if (self._terrainBmp is not None and self._terrainZoom == zoom
                 and self._terrainRegion is region):
             return
-        lightDir = rgnReader.Normalize((1, -5, -1))
+        lightDir = region.Normalize((1, -5, -1))
         heightMap = region.height[::zoom, ::zoom].astype(Numeric.float32)
         heightMap /= Numeric.float32(10)
-        rawRGB = tools3D.onePassColors(
+        rawRGB = terrain.onePassColors(
             False, heightMap.shape, region.waterLevel, heightMap,
-            rgnReader.GradientReader.paletteWater,
-            rgnReader.GradientReader.paletteLand, lightDir)
+            region.gradient.paletteWater,
+            region.gradient.paletteLand, lightDir)
         img = wx.Image(heightMap.shape[1], heightMap.shape[0])
         img.SetData(rawRGB)
         self._terrainBmp = wx.Bitmap(img)
@@ -723,7 +723,7 @@ class OverView(wx.Frame):
         if dlg.ShowModal() == wx.ID_OK:
             dlg.Apply()
             self.mydocs = self.settings.region_dir
-            rgnReader.LoadGradient()
+            region.LoadGradient()
         dlg.Destroy()
 
     def OnCloseWindow(self, event):
@@ -738,7 +738,7 @@ class OverView(wx.Frame):
         sys.exit(0)
 
     def RevertConfig(self, event):
-        self.region.allCities = rgnReader.WorkTheconfig(
+        self.region.allCities = region.WorkTheconfig(
             self.region.originalConfig, 250.0)
         self.region.config = self.region.BuildConfig()
         self.editMode = EDITMODE_NONE
@@ -973,12 +973,12 @@ class OverView(wx.Frame):
                             max(self.back.crop[0], self.back.crop[2]),
                             max(self.back.crop[1], self.back.crop[3])]
                     configSize = (crop[2] - crop[0] + 1, crop[3] - crop[1] + 1)
-                    config = rgnReader.BuildBestConfig(configSize)
+                    config = region.BuildBestConfig(configSize)
                     self.region.config.paste(
                         '#000000', (0, 0, self.region.config.size[0],
                                     self.region.config.size[1]))
                     self.region.config.paste(config, (crop[0], crop[1]))
-                    self.region.allCities = rgnReader.WorkTheconfig(
+                    self.region.allCities = region.WorkTheconfig(
                         self.region.config, self.region.waterLevel)
                     self.region.config = self.region.BuildConfig()
                 self.back.crop = None
@@ -1014,7 +1014,7 @@ class OverView(wx.Frame):
                                 for c in newCities:
                                     self.region.allCities.append(c)
                     self.region.allCities.append(
-                        rgnReader.CityProxy(250.0, newpos[0], newpos[1],
+                        region.CityProxy(250.0, newpos[0], newpos[1],
                                             currentSize, currentSize))
             self.region.config = self.region.BuildConfig()
             self.back.UpdateDrawing()
@@ -1033,7 +1033,7 @@ class OverView(wx.Frame):
             wx.BeginBusyCursor()
             path = dlg.GetPath()
 
-            lightDir = rgnReader.Normalize((1, -5, -1))
+            lightDir = region.Normalize((1, -5, -1))
             s = (self.region.height.shape[1], self.region.height.shape[0])
             xO = yO = 0
             colours = [0, "#FF0000", "#00FF00", 0, "#0000FF"]
@@ -1063,10 +1063,10 @@ class OverView(wx.Frame):
                                           (height, width))
                 h = h.astype(Numeric.float32)
                 h /= Numeric.array(10).astype(Numeric.float32)
-                rawRGB = tools3D.onePassColors(
+                rawRGB = terrain.onePassColors(
                     False, (height, width), self.region.waterLevel, h,
-                    rgnReader.GradientReader.paletteWater,
-                    rgnReader.GradientReader.paletteLand, lightDir)
+                    region.gradient.paletteWater,
+                    region.gradient.paletteLand, lightDir)
                 del h
                 imCity = Image.frombytes("RGB", (width, height), rawRGB)
                 del rawRGB
@@ -1086,10 +1086,10 @@ class OverView(wx.Frame):
                                               (height, width))
                     h = h.astype(Numeric.float32)
                     h /= Numeric.array(10).astype(Numeric.float32)
-                    rawRGB = tools3D.onePassColors(
+                    rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        rgnReader.GradientReader.paletteWater,
-                        rgnReader.GradientReader.paletteLand, lightDir)
+                        region.gradient.paletteWater,
+                        region.gradient.paletteLand, lightDir)
                     del h
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
@@ -1114,10 +1114,10 @@ class OverView(wx.Frame):
                                               (height, width))
                     h = h.astype(Numeric.float32)
                     h /= Numeric.array(10).astype(Numeric.float32)
-                    rawRGB = tools3D.onePassColors(
+                    rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        rgnReader.GradientReader.paletteWater,
-                        rgnReader.GradientReader.paletteLand, lightDir)
+                        region.gradient.paletteWater,
+                        region.gradient.paletteLand, lightDir)
                     del h
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
@@ -1210,10 +1210,10 @@ class OverView(wx.Frame):
                                               (height, width))
                     h = h.astype(Numeric.float32)
                     h /= Numeric.array(10).astype(Numeric.float32)
-                    rawRGB = tools3D.onePassColors(
+                    rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        rgnReader.GradientReader.paletteWater,
-                        rgnReader.GradientReader.paletteLand, lightDir)
+                        region.gradient.paletteWater,
+                        region.gradient.paletteLand, lightDir)
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
                     del rawRGB
@@ -1226,7 +1226,7 @@ class OverView(wx.Frame):
             wx.EndBusyCursor()
 
     def CreateRgn(self, event):
-        result = QuestionDialog.questionDialog(
+        result = dialogs.ask_question(
             'Do you want to create a region from ?',
             buttons=["SC4M", "Grayscale image", "16 bit png", "RGB image",
                      wx.ID_CANCEL])
@@ -1288,7 +1288,7 @@ class OverView(wx.Frame):
 
         try:
             raw = open(sc4mFile, "rb")
-            zipped = zipUtils.ZipInputStream(raw)
+            zipped = zip_utils.ZipInputStream(raw)
             s = zipped.read(4)
             if s != b"SC4M":
                 raise IOError("SC4M")
@@ -1307,7 +1307,7 @@ class OverView(wx.Frame):
                     old_cwd = os.getcwd()
                     os.chdir(os.path.split(sc4mFile)[0])
                     try:
-                        authorNotes = about.AuthorBox(self, htmlText)
+                        authorNotes = about_dialog.AuthorBox(self, htmlText)
                         wx.EndBusyCursor()
                         authorNotes.ShowModal()
                         wx.BeginBusyCursor()
@@ -1341,7 +1341,7 @@ class OverView(wx.Frame):
                 def Update(self, x, y):
                     pass
 
-            NewRegion = rgnReader.SC4Region(None, 250, dlgstub(), config)
+            NewRegion = region.SC4Region(None, 250, dlgstub(), config)
             NewRegion.show(dlgstub())
         except IOError:
             wx.EndBusyCursor()
@@ -1421,7 +1421,7 @@ class OverView(wx.Frame):
         if fromConfig:
             config = Image.open(configName)
         else:
-            config = rgnReader.BuildBestConfig(configSize)
+            config = region.BuildBestConfig(configSize)
 
         class dlgstub:
             def __init__(self):
@@ -1431,7 +1431,7 @@ class OverView(wx.Frame):
                 pass
 
         try:
-            NewRegion = rgnReader.SC4Region(None, 250, dlgstub(), config)
+            NewRegion = region.SC4Region(None, 250, dlgstub(), config)
             NewRegion.show(dlgstub())
         except AssertionError:
             wx.EndBusyCursor()
@@ -1527,7 +1527,7 @@ class OverView(wx.Frame):
         if fromConfig:
             config = Image.open(configName)
         else:
-            config = rgnReader.BuildBestConfig(configSize)
+            config = region.BuildBestConfig(configSize)
 
         class dlgstub:
             def __init__(self):
@@ -1537,7 +1537,7 @@ class OverView(wx.Frame):
                 pass
 
         try:
-            NewRegion = rgnReader.SC4Region(None, 250, dlgstub(), config)
+            NewRegion = region.SC4Region(None, 250, dlgstub(), config)
             NewRegion.show(dlgstub())
         except AssertionError:
             wx.EndBusyCursor()
@@ -1641,7 +1641,7 @@ class OverView(wx.Frame):
         if fromConfig:
             config = Image.open(configName)
         else:
-            config = rgnReader.BuildBestConfig(configSize)
+            config = region.BuildBestConfig(configSize)
 
         class dlgstub:
             def __init__(self):
@@ -1651,7 +1651,7 @@ class OverView(wx.Frame):
                 pass
 
         try:
-            NewRegion = rgnReader.SC4Region(None, 250, dlgstub(), config)
+            NewRegion = region.SC4Region(None, 250, dlgstub(), config)
             NewRegion.show(dlgstub())
         except AssertionError:
             wx.EndBusyCursor()
@@ -1693,7 +1693,7 @@ class OverView(wx.Frame):
             maximum=len(self.region.allCities), parent=self, style=0)
         for i, city in enumerate(self.region.allCities):
             dlgProg.Update(i, "Please wait while exporting the region")
-            citySave = rgnReader.CityProxy(
+            citySave = region.CityProxy(
                 self.region.waterLevel, city.cityXPos - minX,
                 city.cityYPos - minY, city.cityXSize, city.cityYSize)
             heightMap = Numeric.zeros((citySave.ySize, citySave.xSize),
@@ -1756,7 +1756,7 @@ class OverView(wx.Frame):
             maximum=len(self.region.allCities), parent=self, style=0)
         for i, city in enumerate(self.region.allCities):
             dlgProg.Update(i, "Please wait while exporting the region")
-            citySave = rgnReader.CityProxy(
+            citySave = region.CityProxy(
                 self.region.waterLevel, city.cityXPos - minX,
                 city.cityYPos - minY, city.cityXSize, city.cityYSize)
             heightMap = Numeric.zeros((citySave.ySize, citySave.xSize),
@@ -1825,7 +1825,7 @@ class OverView(wx.Frame):
         im2 = Image.new("L", (config.size[0] * 64 + 1, config.size[1] * 64 + 1))
         for i, city in enumerate(self.region.allCities):
             dlgProg.Update(i, "Please wait while exporting the region")
-            citySave = rgnReader.CityProxy(
+            citySave = region.CityProxy(
                 self.region.waterLevel, city.cityXPos - minX,
                 city.cityYPos - minY, city.cityXSize, city.cityYSize)
             heightMap = Numeric.zeros((citySave.ySize, citySave.xSize),
@@ -2046,7 +2046,7 @@ class OverView(wx.Frame):
 
         try:
             dlg.Update(0)
-            NewRegion = rgnReader.SC4Region(self.regionPath, self.waterLevel,
+            NewRegion = region.SC4Region(self.regionPath, self.waterLevel,
                                             dlg)
             if NewRegion.allCities is None:
                 wx.EndBusyCursor()

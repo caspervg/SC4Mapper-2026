@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sc4mapper = "sc4mapper.SC4Map:main"
+sc4mapper = "sc4mapper.__main__:main"
 
 [dependency-groups]
 dev = [

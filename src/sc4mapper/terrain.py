@@ -1,5 +1,5 @@
-"""Pure-Python / NumPy reimplementation of the former C++ extension ``tools3D``
-(``Modules/tools3D.cpp``, copyright (c) 2013 Wouanagaine).
+"""Pure-Python / NumPy reimplementation of the former C++ extension ``terrain``
+(``Modules/terrain.cpp``, copyright (c) 2013 Wouanagaine).
 
 It generates terrain colour maps (:func:`onePassColors`) and isometric region
 thumbnails (:func:`generateImage`).  Output is byte-for-byte compatible with
@@ -13,14 +13,14 @@ _THUMB_H = 428
 
 
 def GetVersion():
-    """Return the codec version string expected by SC4MapApp."""
+    """Return the codec version string expected by app."""
     return "v1.0d"
 
 
 def _gradient_color(palette, keys, value):
     """Linearly interpolate ``palette`` (``{int: (r, g, b)}``) at ``value``.
 
-    Mirrors ``Gradient::GetColor`` from tools3D.cpp, including the integer
+    Mirrors ``Gradient::GetColor`` from terrain.cpp, including the integer
     truncation of the interpolated components.
     """
     if value < keys[0]:

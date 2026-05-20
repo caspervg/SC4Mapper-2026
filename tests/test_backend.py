@@ -1,4 +1,4 @@
-"""Regression tests for the pure-Python backend (qfs, tools3d).
+"""Regression tests for the pure-Python backend (qfs, terrain).
 
 These guard the reimplementation of the former C/C++ extensions.  The three
 committed ``City - *.sc4`` files serve as real-world fixtures.
@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from sc4mapper import qfs
-from sc4mapper import tools3d
+from sc4mapper import terrain
 
 CITY_FILES = ["City - Small.sc4", "City - Medium.sc4", "City - Large.sc4"]
 COMPRESSED_SIG = 0xFB10
@@ -71,11 +71,11 @@ def test_qfs_decode_real_subfiles(city):
     assert found > 0, "expected at least one compressed subfile"
 
 
-def test_tools3d_version():
-    assert tools3d.GetVersion() == "v1.0d"
+def test_terrain_version():
+    assert terrain.GetVersion() == "v1.0d"
 
 
-def test_tools3d_onepasscolors_shape():
+def test_terrain_onepasscolors_shape():
     water = {0: (123, 189, 214), 200: (0, 8, 74)}
     land = {0: (123, 189, 214), 100: (0, 206, 0), 1000: (255, 255, 255)}
     h = np.full((65, 65), 300.0, np.float32)
@@ -83,18 +83,18 @@ def test_tools3d_onepasscolors_shape():
     light = (1.0, -5.0, -1.0)
     norm = (light[0] ** 2 + light[1] ** 2 + light[2] ** 2) ** 0.5
     light = tuple(v / norm for v in light)
-    raw = tools3d.onePassColors(False, h.shape, 250.0, h, water, land, light)
+    raw = terrain.onePassColors(False, h.shape, 250.0, h, water, land, light)
     assert len(raw) == 65 * 65 * 3
     assert isinstance(raw, bytes)
 
 
-def test_tools3d_generateimage_shape():
+def test_terrain_generateimage_shape():
     water = {0: (123, 189, 214), 200: (0, 8, 74)}
     land = {0: (123, 189, 214), 100: (0, 206, 0), 1000: (255, 255, 255)}
     h = np.linspace(100, 800, 65 * 65, dtype=np.float32).reshape((65, 65))
     light = (0.182, -0.913, -0.182)
-    colors = tools3d.onePassColors(False, h.shape, 250.0, h, water, land, light)
-    minx, miny, maxx, maxy, raw = tools3d.generateImage(250.0, h.shape,
+    colors = terrain.onePassColors(False, h.shape, 250.0, h, water, land, light)
+    minx, miny, maxx, maxy, raw = terrain.generateImage(250.0, h.shape,
                                                         h.tobytes(), colors)
     assert len(raw) == 514 * 428 * 6
     assert 0 <= minx <= maxx <= 514

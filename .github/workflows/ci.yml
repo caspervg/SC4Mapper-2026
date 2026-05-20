@@ -57,7 +57,7 @@ jobs:
         run: Compress-Archive -Path dist/SC4Mapper -DestinationPath SC4Mapper-windows-x64.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: SC4Mapper-windows-x64
           path: SC4Mapper-windows-x64.zip
@@ -112,7 +112,7 @@ jobs:
         run: tar -czf "${{ matrix.platform.archive }}" -C dist SC4Mapper
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.archive }}
           path: ${{ matrix.platform.archive }}

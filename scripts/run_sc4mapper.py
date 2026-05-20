@@ -1,6 +1,6 @@
 """PyInstaller entry point for SC4Mapper."""
 
-from sc4mapper.SC4Map import main
+from sc4mapper.__main__ import main
 
 
 if __name__ == "__main__":

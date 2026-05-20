@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from sc4mapper import rgnReader
+from sc4mapper import region
 
 CITY_FILES = ["City - Small.sc4", "City - Medium.sc4", "City - Large.sc4"]
 
@@ -21,7 +21,7 @@ CITY_FILES = ["City - Small.sc4", "City - Medium.sc4", "City - Large.sc4"]
 @pytest.mark.parametrize("city", CITY_FILES)
 def test_sc4file_reads_real_city(city):
     with as_file(files("sc4mapper").joinpath("assets", city)) as path:
-        sc4 = rgnReader.SC4File(str(path))
+        sc4 = region.SC4File(str(path))
         sc4.ReadHeader()
         sc4.ReadEntries()
     assert hasattr(sc4, "heightMapEntry")
@@ -37,20 +37,20 @@ def test_sc4file_reads_real_city(city):
 
 def test_render_pipeline_small_city():
     with as_file(files("sc4mapper").joinpath("assets", "City - Small.sc4")) as path:
-        sc4 = rgnReader.SC4File(str(path))
+        sc4 = region.SC4File(str(path))
         sc4.ReadHeader()
         sc4.ReadEntries()
     heights = np.frombuffer(sc4.heightMapEntry.content[2:], np.float32)
     heights = heights.reshape((sc4.ySize, sc4.xSize)).astype(np.float32)
 
-    light = rgnReader.Normalize((1, -5, -1))
-    rawRGB = rgnReader.tools3D.onePassColors(
+    light = region.Normalize((1, -5, -1))
+    rawRGB = region.terrain.onePassColors(
         False, heights.shape, 250.0, heights,
-        rgnReader.GradientReader.paletteWater,
-        rgnReader.GradientReader.paletteLand, light)
+        region.gradient.paletteWater,
+        region.gradient.paletteLand, light)
     assert len(rawRGB) == sc4.ySize * sc4.xSize * 3
 
-    minx, miny, maxx, maxy, raw = rgnReader.tools3D.generateImage(
+    minx, miny, maxx, maxy, raw = region.terrain.generateImage(
         250.0, heights.shape, heights.tobytes(), rawRGB)
     assert len(raw) == 514 * 428 * 6
 
@@ -63,28 +63,28 @@ def test_save_roundtrip(tmp_path):
     rng = np.random.default_rng(7)
     heightMap = (rng.random((65, 65), dtype=np.float32) * 400.0 + 50.0)
 
-    city = rgnReader.CityProxy(waterLevel, 0, 0, 1, 1)
+    city = region.CityProxy(waterLevel, 0, 0, 1, 1)
     city.heightMap = heightMap
 
-    light = rgnReader.Normalize((1, -5, -1))
-    rawRGB = rgnReader.tools3D.onePassColors(
+    light = region.Normalize((1, -5, -1))
+    rawRGB = region.terrain.onePassColors(
         False, heightMap.shape, waterLevel, heightMap,
-        rgnReader.GradientReader.paletteWater,
-        rgnReader.GradientReader.paletteLand, light)
+        region.gradient.paletteWater,
+        region.gradient.paletteLand, light)
 
-    assert rgnReader.Save(city, folder, rawRGB, waterLevel) is True
+    assert region.Save(city, folder, rawRGB, waterLevel) is True
 
     saved = os.path.join(folder, "City - New city(000-000).sc4")
     assert os.path.isfile(saved)
 
-    sc4 = rgnReader.SC4File(saved)
+    sc4 = region.SC4File(saved)
     sc4.ReadHeader()
     sc4.ReadEntries()
     back = np.frombuffer(sc4.heightMapEntry.content[2:], np.float32)
     back = back.reshape((65, 65))
     assert np.array_equal(back, heightMap)
 
-    saved_file = rgnReader.SaveFile(saved)
+    saved_file = region.SaveFile(saved)
     region_view = next(
         entry for entry in saved_file.entries
         if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000000)))
