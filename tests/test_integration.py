@@ -7,27 +7,23 @@ These run headless (no wx windows are shown) and use the three committed
 import os
 import io
 import struct
-import sys
+from importlib.resources import as_file, files
 
 import numpy as np
 import pytest
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.chdir(ROOT)
-
-import rgnReader  # noqa: E402  (imports wx/PIL; chdir first so the .ini loads)
+from sc4mapper import rgnReader
 
 CITY_FILES = ["City - Small.sc4", "City - Medium.sc4", "City - Large.sc4"]
 
 
 @pytest.mark.parametrize("city", CITY_FILES)
 def test_sc4file_reads_real_city(city):
-    sc4 = rgnReader.SC4File(os.path.join(ROOT, city))
-    sc4.ReadHeader()
-    sc4.ReadEntries()
+    with as_file(files("sc4mapper").joinpath("assets", city)) as path:
+        sc4 = rgnReader.SC4File(str(path))
+        sc4.ReadHeader()
+        sc4.ReadEntries()
     assert hasattr(sc4, "heightMapEntry")
     assert sc4.cityXSize in (1, 2, 4)
     assert sc4.cityXSize == sc4.cityYSize
@@ -40,9 +36,10 @@ def test_sc4file_reads_real_city(city):
 
 
 def test_render_pipeline_small_city():
-    sc4 = rgnReader.SC4File(os.path.join(ROOT, "City - Small.sc4"))
-    sc4.ReadHeader()
-    sc4.ReadEntries()
+    with as_file(files("sc4mapper").joinpath("assets", "City - Small.sc4")) as path:
+        sc4 = rgnReader.SC4File(str(path))
+        sc4.ReadHeader()
+        sc4.ReadEntries()
     heights = np.frombuffer(sc4.heightMapEntry.content[2:], np.float32)
     heights = heights.reshape((sc4.ySize, sc4.xSize)).astype(np.float32)
 

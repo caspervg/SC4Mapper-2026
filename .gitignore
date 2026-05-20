@@ -6,10 +6,12 @@ dist/
 *.pyd
 *.exe
 *.zip
+*.tar.gz
 
 # Python tooling / environments
 .venv/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+codex_tmp/
 uv.lock

@@ -6,17 +6,14 @@ committed ``City - *.sc4`` files serve as real-world fixtures.
 
 import os
 import struct
-import sys
+from importlib.resources import as_file, files
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sc4mapper import qfs
+from sc4mapper import tools3d
 
-import qfs
-import tools3d
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CITY_FILES = ["City - Small.sc4", "City - Medium.sc4", "City - Large.sc4"]
 COMPRESSED_SIG = 0xFB10
 
@@ -62,15 +59,15 @@ def _iter_compressed_subfiles(path):
 
 @pytest.mark.parametrize("city", CITY_FILES)
 def test_qfs_decode_real_subfiles(city):
-    path = os.path.join(ROOT, city)
-    found = 0
-    for stream in _iter_compressed_subfiles(path):
-        found += 1
-        decoded = qfs.decode(stream)
-        declared = (stream[2] << 16) + (stream[3] << 8) + stream[4]
-        assert len(decoded) == declared
-        # round-tripping the *decoded* payload must be lossless
-        assert qfs.decode(qfs.encode(decoded)) == decoded
+    with as_file(files("sc4mapper").joinpath("assets", city)) as path:
+        found = 0
+        for stream in _iter_compressed_subfiles(path):
+            found += 1
+            decoded = qfs.decode(stream)
+            declared = (stream[2] << 16) + (stream[3] << 8) + stream[4]
+            assert len(decoded) == declared
+            # round-tripping the *decoded* payload must be lossless
+            assert qfs.decode(qfs.encode(decoded)) == decoded
     assert found > 0, "expected at least one compressed subfile"
 
 

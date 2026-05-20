@@ -14,11 +14,13 @@ import wx.adv
 import wx.lib.masked as masked
 from PIL import Image, ImageDraw
 
-import about
-import QuestionDialog
-import rgnReader
-import tools3d as tools3D
-import zipUtils
+from . import about
+from . import QuestionDialog
+from . import rgnReader
+from . import settings as appsettings
+from . import tools3d as tools3D
+from . import zipUtils
+from .resources import asset_path
 
 # Sanity check: make sure the (now pure-Python) tools3D backend is the one we
 # expect.  The original guarded against a stale compiled DLL; tools3D is now a
@@ -46,17 +48,15 @@ except Exception:
 MAPPER_VERSION = "2025.0"
 SCROLL_RATE = 1
 
-if getattr(sys, 'frozen', None):
-    basedir = sys._MEIPASS
-else:
-    basedir = os.path.dirname(os.path.abspath(__file__))
-
 
 class CreateRgnFromFile(wx.Dialog):
     """Dialog for entering region settings (file, size, name, config.bmp)."""
 
-    def __init__(self, parent, title, wildCard, bAllowScale=False):
+    def __init__(self, parent, title, wildCard, bAllowScale=False,
+                 default_dir=None, config_default_dir=None):
         self.wildCard = wildCard
+        self.default_dir = default_dir or os.getcwd()
+        self.config_default_dir = config_default_dir or self.default_dir
         wx.Dialog.__init__(self, parent, -1, "Create region from " + title,
                            pos=wx.DefaultPosition, size=wx.DefaultSize,
                            style=wx.DEFAULT_DIALOG_STYLE)
@@ -154,7 +154,7 @@ class CreateRgnFromFile(wx.Dialog):
 
     def OnBrowseFile(self, event):
         dlg = wx.FileDialog(self, message="Choose a file",
-                            defaultDir=os.getcwd(), defaultFile="",
+                            defaultDir=self.default_dir, defaultFile="",
                             wildcard=self.wildCard, style=wx.FD_OPEN)
         if dlg.ShowModal() == wx.ID_OK:
             paths = dlg.GetPaths()
@@ -178,7 +178,7 @@ class CreateRgnFromFile(wx.Dialog):
 
     def OnBrowseConfig(self, event):
         dlg = wx.FileDialog(self, message="Choose a config.bmp",
-                            defaultDir=os.getcwd(), defaultFile="",
+                            defaultDir=self.config_default_dir, defaultFile="",
                             wildcard="config (*.bmp)|*config.bmp",
                             style=wx.FD_OPEN)
         if dlg.ShowModal() == wx.ID_OK:
@@ -204,6 +204,53 @@ class CreateRgnFromFile(wx.Dialog):
             self.sizeY.Enable(False)
             self.configFileName.Enable(True)
         dlg.Destroy()
+
+
+class PreferencesDialog(wx.Dialog):
+    """Edit default folders and the visible colour-gradient INI."""
+
+    def __init__(self, parent, settings):
+        wx.Dialog.__init__(self, parent, -1, "Options",
+                           style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.settings = settings
+
+        self.importDir = wx.DirPickerCtrl(self, path=settings.import_dir)
+        self.regionDir = wx.DirPickerCtrl(self, path=settings.region_dir)
+        self.exportDir = wx.DirPickerCtrl(self, path=settings.export_dir)
+        self.imageSaveDir = wx.DirPickerCtrl(self,
+                                             path=settings.image_save_dir)
+        grid = wx.FlexGridSizer(cols=2, vgap=8, hgap=8)
+        grid.AddGrowableCol(1, 1)
+        fields = [
+            ("Open/import files", self.importDir),
+            ("Save regions", self.regionDir),
+            ("Export regions", self.exportDir),
+            ("Save images", self.imageSaveDir),
+        ]
+        for label, control in fields:
+            grid.Add(wx.StaticText(self, label=label),
+                     0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(control, 1, wx.EXPAND)
+
+        buttons = wx.StdDialogButtonSizer()
+        ok = wx.Button(self, wx.ID_OK)
+        ok.SetDefault()
+        buttons.AddButton(ok)
+        buttons.AddButton(wx.Button(self, wx.ID_CANCEL))
+        buttons.Realize()
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(grid, 1, wx.EXPAND | wx.ALL, 12)
+        sizer.Add(buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        self.SetSizerAndFit(sizer)
+        self.SetMinSize((560, self.GetSize().height))
+
+    def Apply(self):
+        self.settings.import_dir = self.importDir.GetPath()
+        self.settings.region_dir = self.regionDir.GetPath()
+        self.settings.export_dir = self.exportDir.GetPath()
+        self.settings.image_save_dir = self.imageSaveDir.GetPath()
+        self.settings.save()
 
 
 class OverViewCanvas(wx.ScrolledWindow):
@@ -575,6 +622,8 @@ class OverView(wx.Frame):
         self.Bind(wx.EVT_BUTTON, self.SaveRgn, self.btnSaveRgn)
         self.btnExportRgn = wx.Button(self, -1, "Export\nRegion")
         self.Bind(wx.EVT_BUTTON, self.ExportRgn, self.btnExportRgn)
+        self.btnOptions = wx.Button(self, -1, "Options")
+        self.Bind(wx.EVT_BUTTON, self.OnOptions, self.btnOptions)
         self.btnQuit = wx.Button(self, -1, "Quit")
         self.Bind(wx.EVT_BUTTON, self.OnCloseWindow, self.btnQuit)
 
@@ -629,6 +678,7 @@ class OverView(wx.Frame):
         boxh.Add(wx.StaticLine(self, wx.ID_ANY, wx.DefaultPosition,
                                wx.DefaultSize, wx.LI_VERTICAL), 0,
                  wx.EXPAND | wx.RIGHT | wx.LEFT, 5)
+        boxh.Add(self.btnOptions, 0, wx.EXPAND)
 
         boxh.AddStretchSpacer()
 
@@ -641,8 +691,10 @@ class OverView(wx.Frame):
 
         self.SetClientSize((800, 600))
 
-        self.mydocs = wx.StandardPaths.Get().GetDocumentsDir()
-        self.mydocs = os.path.join(self.mydocs, u'SimCity 4/Regions/')
+        default_regions = wx.StandardPaths.Get().GetDocumentsDir()
+        default_regions = os.path.join(default_regions, u'SimCity 4/Regions/')
+        self.settings = appsettings.load(default_regions)
+        self.mydocs = self.settings.region_dir
 
         self.originalColors = None
         self.zoomLevel = 1
@@ -658,6 +710,21 @@ class OverView(wx.Frame):
         self.btnEditMode.Enable(False)
         self.btnExportRgn.Enable(False)
         self.Center()
+
+    def _default_dir(self, path, fallback=None):
+        if path and os.path.isdir(path):
+            return path
+        if fallback and os.path.isdir(fallback):
+            return fallback
+        return os.getcwd()
+
+    def OnOptions(self, event):
+        dlg = PreferencesDialog(self, self.settings)
+        if dlg.ShowModal() == wx.ID_OK:
+            dlg.Apply()
+            self.mydocs = self.settings.region_dir
+            rgnReader.LoadGradient()
+        dlg.Destroy()
 
     def OnCloseWindow(self, event):
         dlg = wx.MessageDialog(self, "Are you sure you want to quit ?",
@@ -956,7 +1023,8 @@ class OverView(wx.Frame):
 
     def SaveBmp(self, event):
         dlg = wx.FileDialog(
-            self, message="Save file as ...", defaultDir=os.getcwd(),
+            self, message="Save file as ...",
+            defaultDir=self._default_dir(self.settings.image_save_dir),
             defaultFile="",
             wildcard="PNG file (*.png)|*.png|"
                      "Jpeg file (*.jpg)|*.jpg|"
@@ -1202,7 +1270,8 @@ class OverView(wx.Frame):
     def CreateRgnFromSC4M(self):
         self.CreateRgnInit()
         dlg = wx.FileDialog(
-            self, message="Choose a SC4M file", defaultDir=os.getcwd(),
+            self, message="Choose a SC4M file",
+            defaultDir=self._default_dir(self.settings.import_dir),
             defaultFile="",
             wildcard="SC4Terraform exported (*.SC4M)|*.SC4M", style=wx.FD_OPEN)
         if dlg.ShowModal() == wx.ID_OK:
@@ -1235,6 +1304,7 @@ class OverView(wx.Frame):
                 lenHtml = struct.unpack("<I", zipped.read(4))[0]
                 if lenHtml:
                     htmlText = zipped.read(lenHtml)
+                    old_cwd = os.getcwd()
                     os.chdir(os.path.split(sc4mFile)[0])
                     try:
                         authorNotes = about.AuthorBox(self, htmlText)
@@ -1244,7 +1314,7 @@ class OverView(wx.Frame):
                         authorNotes.Destroy()
                     except Exception:
                         pass
-                    os.chdir(basedir)
+                    os.chdir(old_cwd)
                 temp = zipped.read(4)
             if temp == b'SC4C':
                 configSize = struct.unpack("<2I", zipped.read(8))
@@ -1301,7 +1371,9 @@ class OverView(wx.Frame):
             self, "8-bit Greyscale",
             "All graphics file |*.jpeg;*.jpg;*.png;*.bmp|"
             "Jpeg file (*.jpeg;*.jpg)|*.jpeg;*.jpg|"
-            "Bitmap file (*.bmp)|*.bmp", True)
+            "Bitmap file (*.bmp)|*.bmp", True,
+            default_dir=self._default_dir(self.settings.import_dir),
+            config_default_dir=self._default_dir(self.settings.import_dir))
         ret = dlg.ShowModal()
 
         if ret == wx.ID_OK:
@@ -1385,7 +1457,10 @@ class OverView(wx.Frame):
 
     def CreateRgnFromPNG(self):
         self.CreateRgnInit()
-        dlg = CreateRgnFromFile(self, "16-bit PNG", "PNG File |*.png")
+        dlg = CreateRgnFromFile(
+            self, "16-bit PNG", "PNG File |*.png",
+            default_dir=self._default_dir(self.settings.import_dir),
+            config_default_dir=self._default_dir(self.settings.import_dir))
         ret = dlg.ShowModal()
         paths = dlg.fileName.GetValue()
         configName = dlg.configFileName.GetValue()
@@ -1488,7 +1563,10 @@ class OverView(wx.Frame):
 
     def CreateRgnFromRGB(self):
         self.CreateRgnInit()
-        dlg = CreateRgnFromFile(self, "RGB", "RGB File |*.png;*.bmp;*.jpg")
+        dlg = CreateRgnFromFile(
+            self, "RGB", "RGB File |*.png;*.bmp;*.jpg",
+            default_dir=self._default_dir(self.settings.import_dir),
+            config_default_dir=self._default_dir(self.settings.import_dir))
         ret = dlg.ShowModal()
         paths = dlg.fileName.GetValue()
         configName = dlg.configFileName.GetValue()
@@ -1729,7 +1807,8 @@ class OverView(wx.Frame):
 
         dlg1 = wx.FileDialog(
             self, message="Enter a valid hml file that will be displayed on "
-            "import", defaultDir=os.getcwd(), defaultFile="",
+            "import", defaultDir=self._default_dir(self.settings.import_dir),
+            defaultFile="",
             wildcard="HTML files (*.HTML)|*.html", style=wx.FD_OPEN)
         if dlg1.ShowModal() == wx.ID_OK:
             htmlFileName = dlg1.GetPaths()[0]
@@ -1807,7 +1886,8 @@ class OverView(wx.Frame):
 
     def ExportRgn(self, event):
         dlg = wx.FileDialog(
-            self, message="Export region as ...", defaultDir=os.getcwd(),
+            self, message="Export region as ...",
+            defaultDir=self._default_dir(self.settings.export_dir),
             defaultFile=self.regionName,
             wildcard="SC4 Terrain files (*.SC4M)|*.SC4M"
                      "|16bit png files (*.png)|*.png|RGB files (*.bmp)|*.bmp",
@@ -1946,7 +2026,7 @@ class OverView(wx.Frame):
 
     def LoadARegion(self):
         dlg = wx.DirDialog(self, "Choose a directory:",
-                           defaultPath=self.mydocs,
+                           defaultPath=self._default_dir(self.mydocs),
                            style=wx.DEFAULT_DIALOG_STYLE | wx.DD_DIR_MUST_EXIST)
         if dlg.ShowModal() == wx.ID_OK:
             self.regionPath = dlg.GetPath()
@@ -2011,8 +2091,8 @@ class OverView(wx.Frame):
 
 class SplashScreen(wx.adv.SplashScreen):
     def __init__(self):
-        bmp = wx.Image(os.path.join(basedir, "splash.jpg"),
-                       wx.BITMAP_TYPE_JPEG).ConvertToBitmap()
+        with asset_path("splash.jpg") as path:
+            bmp = wx.Image(str(path), wx.BITMAP_TYPE_JPEG).ConvertToBitmap()
         wx.adv.SplashScreen.__init__(
             self, bmp,
             wx.adv.SPLASH_CENTRE_ON_SCREEN | wx.adv.SPLASH_TIMEOUT,
@@ -2038,7 +2118,6 @@ class SC4App(wx.App):
 
 
 def main():
-    os.chdir(basedir)
     app = SC4App(False)
     app.MainLoop()
 

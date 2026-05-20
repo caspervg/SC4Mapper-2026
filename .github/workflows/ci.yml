@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    name: Test Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Run tests
+        run: uv run --python 3.12 --group dev pytest
+
+  package-windows:
+    name: Package Windows
+    runs-on: windows-latest
+    needs: test-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Build executable
+        run: uv run --python 3.12 --group build pyinstaller --clean --noconfirm SC4Mapper.spec
+
+      - name: Add user config
+        shell: pwsh
+        run: Copy-Item -Recurse -Force config dist/SC4Mapper/config
+
+      - name: Create archive
+        shell: pwsh
+        run: Compress-Archive -Path dist/SC4Mapper -DestinationPath SC4Mapper-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: SC4Mapper-windows-x64
+          path: SC4Mapper-windows-x64.zip
+          if-no-files-found: error
+
+  package-experimental:
+    name: Package ${{ matrix.platform.name }} Experimental
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: macOS
+            os: macos-latest
+            archive: SC4Mapper-macos-arm64.zip
+          - name: Linux
+            os: ubuntu-latest
+            archive: SC4Mapper-linux-x64.tar.gz
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-0 libnotify4 libsdl2-2.0-0 libwebkit2gtk-4.1-0
+
+      - name: Build executable
+        run: uv run --python 3.12 --group build pyinstaller --clean --noconfirm SC4Mapper.spec
+
+      - name: Add user config
+        run: cp -R config dist/SC4Mapper/config
+
+      - name: Create macOS archive
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/SC4Mapper "${{ matrix.platform.archive }}"
+
+      - name: Create Linux archive
+        if: runner.os == 'Linux'
+        run: tar -czf "${{ matrix.platform.archive }}" -C dist SC4Mapper
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.platform.archive }}
+          path: ${{ matrix.platform.archive }}
+          if-no-files-found: error

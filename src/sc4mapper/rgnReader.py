@@ -11,10 +11,12 @@ import numpy as Numeric
 import wx
 from PIL import Image, ImageDraw
 
-import GradientReader
-import qfs as QFS
-import tools3d as tools3D
-from utils import encodeFilename
+from . import GradientReader
+from . import qfs as QFS
+from . import settings
+from . import tools3d as tools3D
+from .resources import asset_path
+from .utils import encodeFilename
 
 generic_saveValue = 3
 COMPRESSED_SIG = 0xFB10
@@ -243,8 +245,6 @@ class SaveFile(object):
 
 def Save(city, folder, color, waterLevel):
     """Save a city file and build the thumbnail for the region view."""
-    mainPath = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(mainPath)
     if city.cityXSize == 1:
         name = 'City - Small.sc4'
     if city.cityXSize == 2:
@@ -254,8 +254,10 @@ def Save(city, folder, color, waterLevel):
     city.fileName = folder + "/" + "City - New city(%03d-%03d).sc4" % (
         city.cityXPos, city.cityYPos)
     BuildThumbnail(city, color, waterLevel)
-    saved = SaveFile(name)
-    return saved.Save(city.cityXPos, city.cityYPos, city.heightMap, city.fileName)
+    with asset_path(name) as path:
+        saved = SaveFile(str(path))
+        return saved.Save(city.cityXPos, city.cityYPos, city.heightMap,
+                          city.fileName)
 
 
 def BuildThumbnail(city, colors, waterLevel):
@@ -734,4 +736,10 @@ class SC4Region(object):
         return
 
 
-GradientReader.Init('basicColors.ini')
+def LoadGradient(path=None):
+    if path is None:
+        path = settings.load().config_file
+    GradientReader.Init(str(path))
+
+
+LoadGradient()
