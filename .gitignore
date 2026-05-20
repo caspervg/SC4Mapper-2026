@@ -14,4 +14,3 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 codex_tmp/
-uv.lock
