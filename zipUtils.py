@@ -1,7 +1,10 @@
-# File: zlib-example-4.py
+"""A seekable, streaming reader over a zlib-compressed file object.
+
+Operates entirely on ``bytes``.  Used to read zlib-compressed SC4M files.
+"""
 
 import zlib
-import string
+
 
 class ZipInputStream:
 
@@ -11,21 +14,20 @@ class ZipInputStream:
 
     def __rewind(self):
         self.zip = zlib.decompressobj()
-        self.pos = 0 # position in zipped stream
-        self.offset = 0 # position in unzipped stream
-        self.data = ""
+        self.pos = 0       # position in the zipped stream
+        self.offset = 0    # position in the unzipped stream
+        self.data = b""
 
-    def __fill(self, bytes):
+    def __fill(self, nbytes):
         if self.zip:
-            # read until we have enough bytes in the buffer
-            while not bytes or len(self.data) < bytes:
+            # read until we have enough bytes buffered
+            while not nbytes or len(self.data) < nbytes:
                 self.file.seek(self.pos)
-                data = self.file.read(1024*1024)
+                data = self.file.read(1024 * 1024)
                 if not data:
                     self.data = self.data + self.zip.flush()
-                    self.zip = None # no more data
+                    self.zip = None   # no more data
                     break
-                print 'zip read'
                 self.pos = self.pos + len(data)
                 self.data = self.data + self.zip.decompress(data)
 
@@ -35,9 +37,9 @@ class ZipInputStream:
         elif whence == 1:
             position = self.offset + offset
         else:
-            raise IOError, "Illegal argument"
+            raise IOError("Illegal argument")
         if position < self.offset:
-            raise IOError, "Cannot seek backwards"
+            raise IOError("Cannot seek backwards")
 
         # skip forward, in 16k blocks
         while position > self.offset:
@@ -47,41 +49,31 @@ class ZipInputStream:
     def tell(self):
         return self.offset
 
-    def read(self, bytes = 0):
-        self.__fill(bytes)
-        if bytes:
-            data = self.data[:bytes]
-            self.data = self.data[bytes:]
+    def read(self, nbytes=0):
+        self.__fill(nbytes)
+        if nbytes:
+            data = self.data[:nbytes]
+            self.data = self.data[nbytes:]
         else:
             data = self.data
-            self.data = ""
+            self.data = b""
         self.offset = self.offset + len(data)
         return data
 
     def readline(self):
         # make sure we have an entire line
-        while self.zip and "\n" not in self.data:
+        while self.zip and b"\n" not in self.data:
             self.__fill(len(self.data) + 512)
-        i = string.find(self.data, "\n") + 1
+        i = self.data.find(b"\n") + 1
         if i <= 0:
             return self.read()
         return self.read(i)
 
     def readlines(self):
         lines = []
-        while 1:
+        while True:
             s = self.readline()
             if not s:
                 break
             lines.append(s)
         return lines
-
-#
-# try it out
-if 0:
-	data = open("samples/sample.txt").read()
-	data = zlib.compress(data)
-
-	file = ZipInputStream(StringIO.StringIO(data))
-	for line in file.readlines():
-		print line[:-1]

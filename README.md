@@ -1,24 +1,69 @@
 SC4Mapper-2013
 ==============
 
-![ZIP](http://imageshack.us/a/img803/7351/screenshot060r.jpg)
-SC4 Region import/export tool
+SimCity 4 region import/export tool.
 
-check [SC4Devotion](http://sc4devotion.com/forums/index.php?topic=15455.0) for more informations, might need registration
+Check [SC4Devotion](http://sc4devotion.com/forums/index.php?topic=15455.0)
+for more information (registration may be required).
 
-and [LEX](http://sc4devotion.com/csxlex/lex_filedesc.php?lotGET=2880) to get Windows executable
- 
-Executables files need to be uploaded on the [LEX](http://sc4devotion.com/csxlex/) at [SC4Devotion](http://www.sc4devotion.com)
+Modern rewrite
+==============
 
-Requierements
-=============
-- [python 2.7](http://www.python.org)
-- [Numpy 1.6.2](http://sourceforge.net/project/showfiles.php?group_id=1369&package_id=175103) or higher
-- [PIL 1.1.7](http://www.pythonware.com/products/pil/) or higher
-- [pywin32 218](http://sourceforge.net/projects/pywin32/) or higher
-- [wxPython 2.9.4](http://www.wxpython.org/download.php#unstable) or higher
+This is a Python 3 / wxPython 4 modernisation of the original 2013 code base.
+The two former C/C++ extension modules have been reimplemented in pure
+Python / NumPy, so **no C compiler is required** and the project is now
+installable on any platform with `pip` / `uv`:
+
+- `qfs.py` replaces the `QFS` C extension (QFS / RefPack compression).
+- `tools3d.py` replaces the `tools3D` C++ extension (terrain colouring and
+  isometric thumbnail generation).
+
+The original `Modules/` C sources are kept for historical reference only and
+are no longer built or imported.
+
+Requirements
+============
+
+- Python 3.10 or newer
+- [NumPy](https://numpy.org) 1.26+
+- [Pillow](https://python-pillow.org) 10+
+- [wxPython](https://www.wxpython.org) 4.2+
+
+Setup with [uv](https://docs.astral.sh/uv/)
+===========================================
+
+```sh
+uv venv
+uv pip install -e .
+```
+
+Running
+=======
+
+```sh
+uv run python SC4Map.py
+```
+
+or, after `uv pip install -e .`, via the installed entry point:
+
+```sh
+uv run sc4mapper
+```
+
+Tests
+=====
+
+A regression suite guards the reimplemented backend (QFS round-trips against
+the committed `City - *.sc4` fixtures, the terrain/thumbnail renderers, and a
+full DBPF save round-trip):
+
+```sh
+uv pip install --group dev
+uv run pytest
+```
 
 Contributors
 ============
+
 - Wouanagaine
 - JoeST

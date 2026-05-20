@@ -1,16 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""Filesystem helpers.
 
-import os
-import sys
+On Python 3 paths are ``str`` and the OS layer handles encoding, so
+:func:`encodeFilename` is a no-op kept only for API compatibility.
+"""
+
 
 def encodeFilename(s):
-	"""
-	@param s The name of the file (of type unicode)
-	"""
-
-	if type(s) == type( '' ):
-		return s
-	assert type(s) == type(u'')
-
-	return s.encode(sys.getfilesystemencoding(), 'ignore')
+    """Return ``s`` unchanged (kept for backwards compatibility)."""
+    return s

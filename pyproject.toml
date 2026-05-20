@@ -1,0 +1,34 @@
+[project]
+name = "sc4mapper"
+version = "2025.0"
+description = "SimCity 4 region import/export tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "license.txt" }
+authors = [
+    { name = "Wouanagaine" },
+    { name = "JoeST" },
+]
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "wxPython>=4.2",
+]
+
+[project.scripts]
+sc4mapper = "SC4Map:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools]
+py-modules = [
+    "SC4Map", "SC4MapApp", "rgnReader", "GradientReader",
+    "QuestionDialog", "about", "utils", "zipUtils", "qfs", "tools3d",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
