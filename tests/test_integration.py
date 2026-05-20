@@ -5,11 +5,13 @@ These run headless (no wx windows are shown) and use the three committed
 """
 
 import os
+import io
 import struct
 import sys
 
 import numpy as np
 import pytest
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -84,3 +86,27 @@ def test_save_roundtrip(tmp_path):
     back = np.frombuffer(sc4.heightMapEntry.content[2:], np.float32)
     back = back.reshape((65, 65))
     assert np.array_equal(back, heightMap)
+
+    saved_file = rgnReader.SaveFile(saved)
+    region_view = next(
+        entry for entry in saved_file.entries
+        if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000000)))
+    alpha_view = next(
+        entry for entry in saved_file.entries
+        if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000002)))
+    transport_view = next(
+        entry for entry in saved_file.entries
+        if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000004)))
+    transport_alpha_view = next(
+        entry for entry in saved_file.entries
+        if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000006)))
+    assert transport_view.content == region_view.content
+    assert transport_alpha_view.content == alpha_view.content
+    for entry in (region_view, alpha_view, transport_view, transport_alpha_view):
+        im = Image.open(io.BytesIO(entry.content))
+        assert im.mode == "RGBA"
+        assert entry.content[25] == 6
+    region_im = Image.open(io.BytesIO(region_view.content))
+    alpha_im = Image.open(io.BytesIO(alpha_view.content))
+    assert region_im.getchannel("A").getextrema() == (0, 255)
+    assert alpha_im.getchannel("A").getextrema() == (0, 0)

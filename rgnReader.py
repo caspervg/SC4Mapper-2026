@@ -161,6 +161,11 @@ class SaveFile(object):
         self.sc4.truncate(self.indexRecordPosition)
         self.sc4.seek(self.indexRecordPosition)
         pos = self.indexRecordPosition + self.indexRecordLength
+        n = os.path.splitext(saveName)[0]
+        with open(n + ".PNG", "rb") as png:
+            regionPngData = png.read()
+        with open(n + "_alpha.PNG", "rb") as png:
+            alphaPngData = png.read()
         for entry in self.entries:
             entry.fileLocation = pos
             newbuffer = (entry.buffer[0:0x0C] + struct.pack("<i", entry.fileLocation)
@@ -191,11 +196,7 @@ class SaveFile(object):
                 entry.compressed = 1
                 entry.filesize = len(newDataCity)
             if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000000)):  # region view
-                n = os.path.splitext(saveName)[0]
-                png = open(n + ".PNG", "rb")
-                pngData = png.read()
-                png.close()
-                os.unlink(n + ".PNG")
+                pngData = regionPngData
                 newbuffer = (entry.buffer[0:0x0C]
                              + struct.pack("<I", entry.fileLocation)
                              + struct.pack("<I", len(pngData))
@@ -204,11 +205,25 @@ class SaveFile(object):
                 entry.compressed = 0
                 entry.filesize = len(pngData)
             if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000002)):  # alpha view
-                n = os.path.splitext(saveName)[0]
-                png = open(n + "_alpha.PNG", "rb")
-                pngData = png.read()
-                png.close()
-                os.unlink(n + "_alpha.PNG")
+                pngData = alphaPngData
+                newbuffer = (entry.buffer[0:0x0C]
+                             + struct.pack("<I", entry.fileLocation)
+                             + struct.pack("<I", len(pngData))
+                             + entry.buffer[0x10 + 4:])
+                entry.rawContent = pngData
+                entry.compressed = 0
+                entry.filesize = len(pngData)
+            if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000004)):  # transport view
+                pngData = regionPngData
+                newbuffer = (entry.buffer[0:0x0C]
+                             + struct.pack("<I", entry.fileLocation)
+                             + struct.pack("<I", len(pngData))
+                             + entry.buffer[0x10 + 4:])
+                entry.rawContent = pngData
+                entry.compressed = 0
+                entry.filesize = len(pngData)
+            if entry.IsItThisTGI((0x8a2482b9, 0x4a2482bb, 0x00000006)):  # transport alpha view
+                pngData = alphaPngData
                 newbuffer = (entry.buffer[0:0x0C]
                              + struct.pack("<I", entry.fileLocation)
                              + struct.pack("<I", len(pngData))
@@ -221,6 +236,8 @@ class SaveFile(object):
         for entry in self.entries:
             self.sc4.write(entry.rawContent)
         self.sc4.close()
+        os.unlink(n + ".PNG")
+        os.unlink(n + "_alpha.PNG")
         return True
 
 
@@ -250,10 +267,14 @@ def BuildThumbnail(city, colors, waterLevel):
     offset = len(r) // 2
     im = Image.frombytes("RGB", (514, 428), r[:offset])
     im = im.crop([minx, miny, maxx, maxy])
+    alpha = Image.frombytes("RGB", (514, 428), r[offset:])
+    alpha = alpha.crop([minx, miny, maxx, maxy])
+
+    coverage = alpha.getchannel("B")
+    im.putalpha(coverage)
     im.save(n + ".PNG")
-    im = Image.frombytes("RGB", (514, 428), r[offset:])
-    im = im.crop([minx, miny, maxx, maxy])
-    im.save(n + "_alpha.PNG")
+    alpha.putalpha(0)
+    alpha.save(n + "_alpha.PNG")
     return
 
 
