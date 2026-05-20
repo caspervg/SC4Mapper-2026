@@ -1,6 +1,6 @@
 """Entry point for SC4Mapper."""
 
-from .app import main
+from sc4mapper.app import main
 
 if __name__ == "__main__":
     main()

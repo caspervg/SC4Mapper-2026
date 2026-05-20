@@ -16,10 +16,12 @@ from PIL import Image, ImageDraw
 
 from . import about_dialog
 from . import dialogs
+from . import gradient
 from . import region
 from . import settings as appsettings
 from . import terrain
 from . import zip_utils
+from .region import Normalize
 from .resources import asset_path
 from .version import get_version
 
@@ -289,13 +291,13 @@ class OverViewCanvas(wx.ScrolledWindow):
         if (self._terrainBmp is not None and self._terrainZoom == zoom
                 and self._terrainRegion is region):
             return
-        lightDir = region.Normalize((1, -5, -1))
+        lightDir = Normalize((1, -5, -1))
         heightMap = region.height[::zoom, ::zoom].astype(Numeric.float32)
         heightMap /= Numeric.float32(10)
         rawRGB = terrain.onePassColors(
             False, heightMap.shape, region.waterLevel, heightMap,
-            region.gradient.paletteWater,
-            region.gradient.paletteLand, lightDir)
+            gradient.paletteWater,
+            gradient.paletteLand, lightDir)
         img = wx.Image(heightMap.shape[1], heightMap.shape[0])
         img.SetData(rawRGB)
         self._terrainBmp = wx.Bitmap(img)
@@ -1034,7 +1036,7 @@ class OverView(wx.Frame):
             wx.BeginBusyCursor()
             path = dlg.GetPath()
 
-            lightDir = region.Normalize((1, -5, -1))
+            lightDir = Normalize((1, -5, -1))
             s = (self.region.height.shape[1], self.region.height.shape[0])
             xO = yO = 0
             colours = [0, "#FF0000", "#00FF00", 0, "#0000FF"]
@@ -1066,8 +1068,8 @@ class OverView(wx.Frame):
                 h /= Numeric.array(10).astype(Numeric.float32)
                 rawRGB = terrain.onePassColors(
                     False, (height, width), self.region.waterLevel, h,
-                    region.gradient.paletteWater,
-                    region.gradient.paletteLand, lightDir)
+                    gradient.paletteWater,
+                    gradient.paletteLand, lightDir)
                 del h
                 imCity = Image.frombytes("RGB", (width, height), rawRGB)
                 del rawRGB
@@ -1089,8 +1091,8 @@ class OverView(wx.Frame):
                     h /= Numeric.array(10).astype(Numeric.float32)
                     rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        region.gradient.paletteWater,
-                        region.gradient.paletteLand, lightDir)
+                        gradient.paletteWater,
+                        gradient.paletteLand, lightDir)
                     del h
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
@@ -1117,8 +1119,8 @@ class OverView(wx.Frame):
                     h /= Numeric.array(10).astype(Numeric.float32)
                     rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        region.gradient.paletteWater,
-                        region.gradient.paletteLand, lightDir)
+                        gradient.paletteWater,
+                        gradient.paletteLand, lightDir)
                     del h
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
@@ -1213,8 +1215,8 @@ class OverView(wx.Frame):
                     h /= Numeric.array(10).astype(Numeric.float32)
                     rawRGB = terrain.onePassColors(
                         False, (height, width), self.region.waterLevel, h,
-                        region.gradient.paletteWater,
-                        region.gradient.paletteLand, lightDir)
+                        gradient.paletteWater,
+                        gradient.paletteLand, lightDir)
                     imCity = Image.frombytes(
                         "RGB", (width, height), rawRGB).convert("L").convert("RGB")
                     del rawRGB
