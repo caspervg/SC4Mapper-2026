@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 from . import about_dialog
 from . import dialogs
 from . import gradient
+from . import png16
 from . import region
 from . import settings as appsettings
 from . import terrain
@@ -1477,6 +1478,18 @@ class OverView(wx.Frame):
         name = os.path.splitext(name)[0]
 
         im = Image.open(paths)
+        im.load()
+        # Pillow 10+ keeps 16-bit grayscale PNGs as I;16, not I.
+        if not png16.is_16bit_grayscale(im):
+            dlg1 = wx.MessageDialog(
+                self, paths + ' is not a valid 16-bit grayscale PNG\n'
+                '(Pillow mode %r). Use "Grayscale image" for 8-bit files.'
+                % (im.mode,),
+                'Region creation error', wx.OK | wx.ICON_ERROR)
+            dlg1.ShowModal()
+            dlg1.Destroy()
+            return
+        im = png16.as_mode_i(im)
         if not (im.size[0] == configSize[0] * 64 + 1
                 and im.size[1] == configSize[1] * 64 + 1):
             dlg1 = wx.MessageDialog(
@@ -1492,15 +1505,9 @@ class OverView(wx.Frame):
             if res == wx.ID_YES:
                 im = im.resize((configSize[0] * 64 + 1, configSize[1] * 64 + 1),
                                Image.Resampling.BICUBIC)
+                im = png16.as_mode_i(im)
             else:
                 return
-        if im.mode != "I":
-            dlg1 = wx.MessageDialog(
-                self, configName + ' seems not to be a valid 16 bit grescale image',
-                'Region creation error', wx.OK | wx.ICON_ERROR)
-            dlg1.ShowModal()
-            dlg1.Destroy()
-            return
 
         dlgProg = wx.ProgressDialog(
             "Loading PNG", "Please wait while loading the region",
