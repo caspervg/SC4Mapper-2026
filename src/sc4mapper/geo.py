@@ -802,6 +802,128 @@ def build_region_grid(request, fetcher, progress=None):
     )
 
 
+# --- Georeference sidecar -------------------------------------------------
+
+#: TGI of the georeference record written into each city save.
+#:
+#: SimCity 4 saves are DBPF archives, and an entry the game does not
+#: recognise rides along beside the ones it does. Stashing the import's
+#: georeference there means it travels with the city: share the save and
+#: whoever opens it -- SC4Mapper, or a DLL plugin inside the game -- can
+#: work out which patch of the real world each cell stands for, with no
+#: sidecar file to lose.
+GEOREF_TYPE = 0x9A6D5C21
+GEOREF_GROUP = 0x53434752  # 'SCGR'
+GEOREF_INSTANCE = 0x00000001
+GEOREF_TGI = (GEOREF_TYPE, GEOREF_GROUP, GEOREF_INSTANCE)
+
+#: Bumped when the meaning of a field changes, so a reader can refuse a
+#: record it would misinterpret.
+GEOREF_VERSION = 1
+
+
+def build_georef_record(georeference, offset_x=0, offset_z=0, tile_size=1,
+                        region_name=None, import_id=None):
+    """Describe where one city tile sits in the real world.
+
+    ``offset_x`` / ``offset_z`` are the tile's origin in **cells**, measured
+    from the north-west corner of the imported grid, so a reader can place
+    any cell without knowing how the region was cropped afterwards.
+
+    The payload is UTF-8 JSON. It is a few hundred bytes, and being text it
+    can be versioned, read from any language without tooling, and eyeballed
+    by anyone who opens a save in a hex editor -- which matters more for a
+    community format than the bytes a binary encoding would save.
+    """
+    import json
+
+    record = {
+        "format": "sc4mapper.georef",
+        "version": GEOREF_VERSION,
+        "frame": {
+            # The local metric frame the whole region was sampled on.
+            "center_lat": georeference.center_lat,
+            "center_lon": georeference.center_lon,
+            "grid_width": georeference.tiles_x * CELLS_PER_TILE + 1,
+            "grid_height": georeference.tiles_y * CELLS_PER_TILE + 1,
+            "metres_per_cell": georeference.metres_per_cell,
+            "rotation_deg": georeference.rotation_deg,
+        },
+        "tile": {
+            # Where this city sits inside that frame.
+            "offset_x": int(offset_x),
+            "offset_z": int(offset_z),
+            "size": int(tile_size),
+            "cells": int(tile_size) * CELLS_PER_TILE,
+        },
+        "heights": {
+            "sea_level_m": georeference.sea_level_m,
+            "vertical_scale": georeference.vertical_scale,
+            "sea_reference_m": georeference.sea_reference_m,
+        },
+        "source": {
+            "elevation": georeference.source,
+            "zoom": georeference.zoom,
+        },
+    }
+    if region_name:
+        record["region"] = str(region_name)
+    if import_id:
+        record["import_id"] = str(import_id)
+    return json.dumps(record, indent=1, sort_keys=True).encode("utf-8")
+
+
+def parse_georef_record(payload):
+    """Read a georeference record back. Returns ``None`` if it is not one."""
+    import json
+
+    if not payload:
+        return None
+    try:
+        record = json.loads(bytes(payload).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("format") != "sc4mapper.georef":
+        return None
+    try:
+        if int(record.get("version", 0)) > GEOREF_VERSION:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return record
+
+
+def georef_cell_to_lonlat(record, cell_x, cell_z):
+    """Longitude/latitude of a cell within the tile a record describes.
+
+    ``cell_x`` / ``cell_z`` are local to the city tile, so (0, 0) is its
+    north-west corner. This inverts the sampling grid, and exists so the
+    format has a reference implementation that other readers -- a DLL
+    plugin, say -- can be checked against.
+    """
+    frame = record["frame"]
+    tile = record["tile"]
+    spacing = float(frame["metres_per_cell"])
+
+    column = float(tile["offset_x"]) + np.asarray(cell_x, dtype=np.float64)
+    row = float(tile["offset_z"]) + np.asarray(cell_z, dtype=np.float64)
+
+    east = (column - (float(frame["grid_width"]) - 1) / 2.0) * spacing
+    north = ((float(frame["grid_height"]) - 1) / 2.0 - row) * spacing
+
+    rotation = float(frame.get("rotation_deg", 0.0))
+    if rotation:
+        theta = math.radians(rotation)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        east, north = (east * cos_t + north * sin_t,
+                       -east * sin_t + north * cos_t)
+
+    return local_offsets_to_lonlat(frame["center_lat"], frame["center_lon"],
+                                   east, north)
+
+
 # --- City tile layout -----------------------------------------------------
 
 # config.bmp encodes city size as a colour: one pixel is one small tile.

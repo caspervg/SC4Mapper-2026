@@ -143,6 +143,49 @@ applications from drawing on their servers -- so choosing a provider, and
 supplying any API key it needs, is left to you. Any XYZ tile URL works;
 note that some providers order the path `{z}/{y}/{x}`.
 
+### Georeference Record
+
+Every city saved from a real-world import carries a small record saying
+where on Earth it came from, stored inside the `.sc4` under its own TGI
+(`0x9A6D5C21` / `0x53434752` / `1`). SimCity 4 ignores entries it does not
+recognise, so it simply rides along with the save -- share the region and
+the georeferencing goes with it, with no sidecar file to lose.
+
+The payload is UTF-8 JSON, a few hundred bytes:
+
+```json
+{
+ "format": "sc4mapper.georef",
+ "version": 1,
+ "frame": {
+  "center_lat": 37.7955, "center_lon": -122.447,
+  "grid_width": 769, "grid_height": 769,
+  "metres_per_cell": 16.0, "rotation_deg": 0.0
+ },
+ "tile": { "offset_x": 256, "offset_z": 128, "size": 4, "cells": 256 },
+ "heights": { "sea_level_m": 250.0, "vertical_scale": 1.0,
+              "sea_reference_m": 0.0 },
+ "source": { "elevation": "...terrarium/{z}/{x}/{y}.png", "zoom": 13 }
+}
+```
+
+`frame` is the local metric grid the whole region was sampled on; `tile`
+says where this particular city sits inside it, in cells from the grid's
+north-west corner. Between them, a reader can turn any cell in the city
+into a latitude and longitude -- which is what a DLL plugin would need to
+line real-world data up with the terrain in game.
+`sc4mapper.geo.georef_cell_to_lonlat` is the reference implementation, and
+the tests check it against the grid the importer actually sampled.
+
+It is JSON rather than a binary format on purpose: it is small enough that
+compactness buys nothing, it can be read from any language without
+tooling, and anyone poking at a save in a hex editor can see what it says.
+
+One caveat if you are writing a reader: SimCity 4 rebuilds the archive when
+it saves a city, and nothing registers a handler for this entry, so it may
+well be dropped the first time a player saves in game. A plugin that wants
+the record to survive should read it on load and write it back on save.
+
 ## Running From Source
 
 Install [uv](https://docs.astral.sh/uv/), then:
