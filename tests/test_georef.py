@@ -266,3 +266,160 @@ def test_saving_twice_does_not_duplicate_the_entry(tmp_path):
     assert save.indexRecordEntryCount == before  # already present, replaced
     save.AddOrReplaceEntry(geo.GEOREF_TGI, payload + b" ")
     assert save.indexRecordEntryCount == before
+
+
+# --- the inverse: what a plugin actually needs ---------------------------
+
+
+def test_lonlat_to_cell_inverts_cell_to_lonlat():
+    """Round trip: a cell, out to the world, and back to the same cell."""
+    record = geo.parse_georef_record(
+        geo.build_georef_record(make_georeference(tiles_x=4, tiles_y=4),
+                                offset_x=128, offset_z=64, tile_size=2))
+    for cell_x, cell_z in [(0, 0), (1, 1), (63, 127), (128, 128), (37, 91)]:
+        lon, lat = geo.georef_cell_to_lonlat(record, cell_x, cell_z)
+        back_x, back_z = geo.georef_lonlat_to_cell(record, lon, lat)
+        assert back_x == pytest.approx(cell_x, abs=1e-6)
+        assert back_z == pytest.approx(cell_z, abs=1e-6)
+
+
+@pytest.mark.parametrize("rotation", [0.0, 15.0, 90.0, -37.5, 180.0])
+def test_round_trip_holds_under_rotation(rotation):
+    record = geo.parse_georef_record(
+        geo.build_georef_record(
+            make_georeference(rotation_deg=rotation, tiles_x=2, tiles_y=2),
+            offset_x=64, offset_z=0, tile_size=1))
+    lon, lat = geo.georef_cell_to_lonlat(record, 20, 44)
+    back_x, back_z = geo.georef_lonlat_to_cell(record, lon, lat)
+    assert back_x == pytest.approx(20, abs=1e-6)
+    assert back_z == pytest.approx(44, abs=1e-6)
+
+
+def test_round_trip_holds_at_high_latitude():
+    """Where the per-row longitude scaling matters most."""
+    record = geo.parse_georef_record(
+        geo.build_georef_record(
+            make_georeference(center_lat=69.65, center_lon=18.96,
+                              tiles_x=8, tiles_y=8, metres_per_cell=48.0)))
+    for cell_x, cell_z in [(0, 0), (511, 511), (100, 400)]:
+        lon, lat = geo.georef_cell_to_lonlat(record, cell_x, cell_z)
+        back_x, back_z = geo.georef_lonlat_to_cell(record, lon, lat)
+        assert back_x == pytest.approx(cell_x, abs=1e-4)
+        assert back_z == pytest.approx(cell_z, abs=1e-4)
+
+
+def test_points_outside_the_tile_report_outside():
+    record = geo.parse_georef_record(
+        geo.build_georef_record(make_georeference(tiles_x=4, tiles_y=4),
+                                offset_x=128, offset_z=128, tile_size=1))
+    # A point one tile north-west of this city.
+    lon, lat = geo.georef_cell_to_lonlat(record, -64, -64)
+    cell_x, cell_z = geo.georef_lonlat_to_cell(record, lon, lat)
+    assert cell_x < 0 and cell_z < 0
+
+
+def test_inverse_accepts_arrays():
+    record = geo.parse_georef_record(geo.build_georef_record(make_georeference()))
+    lon, lat = geo.georef_cell_to_lonlat(record, np.array([0, 5, 10]),
+                                         np.array([0, 5, 10]))
+    cell_x, cell_z = geo.georef_lonlat_to_cell(record, lon, lat)
+    assert np.allclose(cell_x, [0, 5, 10], atol=1e-6)
+    assert np.allclose(cell_z, [0, 5, 10], atol=1e-6)
+
+
+# --- self-describing projection ------------------------------------------
+
+
+def test_record_publishes_its_projection():
+    """A reader must not have to guess at the earth model."""
+    record = geo.parse_georef_record(geo.build_georef_record(make_georeference()))
+    projection = record["projection"]
+    assert projection["model"] == geo.PROJECTION_MODEL
+    assert projection["crs"] == "EPSG:4326"
+    assert projection["metres_per_degree_lat_coeffs"] == list(
+        geo.METRES_PER_DEGREE_LAT_COEFFS)
+    assert projection["metres_per_degree_lon_coeffs"] == list(
+        geo.METRES_PER_DEGREE_LON_COEFFS)
+
+
+def test_published_coefficients_are_the_ones_actually_used():
+    """The record cannot drift from the code that produced it."""
+    import math as _math
+    record = geo.parse_georef_record(geo.build_georef_record(make_georeference()))
+    a, b, c, d = record["projection"]["metres_per_degree_lat_coeffs"]
+    for lat in (0.0, 23.5, 52.0, -33.9):
+        phi = _math.radians(lat)
+        expected = (a + b * _math.cos(2 * phi) + c * _math.cos(4 * phi)
+                    + d * _math.cos(6 * phi))
+        assert geo.metres_per_degree_lat(lat) == pytest.approx(expected)
+
+    a, b, c = record["projection"]["metres_per_degree_lon_coeffs"]
+    for lat in (0.0, 23.5, 52.0, -33.9):
+        phi = _math.radians(lat)
+        expected = (a * _math.cos(phi) + b * _math.cos(3 * phi)
+                    + c * _math.cos(5 * phi))
+        assert float(geo.metres_per_degree_lon(lat)) == pytest.approx(expected)
+
+
+def test_record_states_how_water_was_handled():
+    """Heights below the shoreline are not invertible; say so."""
+    record = geo.parse_georef_record(
+        geo.build_georef_record(make_georeference(), ocean_depth_m=35.0,
+                                keep_bathymetry=False))
+    assert record["heights"]["ocean_depth_m"] == pytest.approx(35.0)
+    assert record["heights"]["keep_bathymetry"] is False
+
+    record = geo.parse_georef_record(
+        geo.build_georef_record(make_georeference(), keep_bathymetry=True))
+    assert record["heights"]["keep_bathymetry"] is True
+
+
+def test_height_mapping_is_invertible_above_the_shoreline():
+    """Given an in-game height, a reader can recover the real elevation."""
+    georeference = make_georeference(vertical_scale=0.5, sea_reference_m=560.0)
+    record = geo.parse_georef_record(geo.build_georef_record(georeference))
+    heights = record["heights"]
+
+    real = 812.0
+    in_game = (heights["sea_level_m"]
+               + (real - heights["sea_reference_m"]) * heights["vertical_scale"])
+    recovered = (heights["sea_reference_m"]
+                 + (in_game - heights["sea_level_m"]) / heights["vertical_scale"])
+    assert recovered == pytest.approx(real)
+
+
+def test_saved_city_records_region_name_and_import_id(tmp_path):
+    """Both were plumbed but never set; a save must actually carry them."""
+    config = geo.build_config_image((1, 1), 1)
+    new_region = region.SC4Region(None, 250.0, None, config)
+    new_region.show(None)
+    new_region.height = np.full(new_region.shape, 2600, dtype=np.uint16)
+    new_region.georeference = make_georeference(tiles_x=1, tiles_y=1)
+    new_region.regionName = "San Francisco"
+    new_region.importId = "deadbeef"
+    folder = str(tmp_path / "named")
+    os.makedirs(folder, exist_ok=True)
+    new_region.folder = folder
+
+    class Progress:
+        def Update(self, *args):
+            pass
+
+    minX, minY, maxX, maxY, sx, sy, cropped = new_region.CropConfig()
+    assert new_region.Save(Progress(), minX, minY,
+                           [minX * 64, minY * 64, maxX * 64 + 1, maxY * 64 + 1])
+
+    name = sorted(f for f in os.listdir(folder) if f.endswith(".sc4"))[0]
+    with open(os.path.join(folder, name), "rb") as fh:
+        blob = fh.read()
+    raw = struct.unpack("<4s17I24s", blob[:96])
+    count, index_pos, index_len = raw[9], raw[10], raw[11]
+    index = blob[index_pos:index_pos + index_len]
+    record = None
+    for i in range(count):
+        t, g, inst, loc, size = struct.unpack("<3I2i", index[i * 20:i * 20 + 20])
+        if (t, g, inst) == geo.GEOREF_TGI:
+            record = geo.parse_georef_record(blob[loc:loc + size])
+    assert record is not None
+    assert record["region"] == "San Francisco"
+    assert record["import_id"] == "deadbeef"

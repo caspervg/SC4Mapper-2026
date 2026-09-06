@@ -6,6 +6,7 @@ import os
 import os.path
 import struct
 import sys
+import uuid
 import zlib
 
 import numpy as Numeric
@@ -1728,6 +1729,11 @@ class OverView(wx.Frame):
         self.region.height = result.height_dm
         self.region.basemap = basemap
         self.region.georeference = result.georeference
+        # Carried into the georeference record written into each city save.
+        self.region.regionName = self.regionName
+        self.region.importId = uuid.uuid4().hex
+        self.region.oceanDepth = request.ocean_depth_m
+        self.region.keepBathymetry = request.keep_bathymetry
         self.zoomLevel = 1
         self.zoomLevelPow = 0
         self.back.SetVirtualSize((self.region.height.shape[1],

@@ -758,6 +758,9 @@ class SC4Region(object):
                 offset_z=citySave.yPos + subRgn[1],
                 tile_size=citySave.cityXSize,
                 region_name=getattr(self, "regionName", None),
+                import_id=getattr(self, "importId", None),
+                ocean_depth_m=getattr(self, "oceanDepth", 20.0),
+                keep_bathymetry=getattr(self, "keepBathymetry", False),
             )
         except Exception:
             return None

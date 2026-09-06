@@ -133,13 +133,27 @@ def zoom_for_resolution(target_m, lat, max_zoom=SOURCE_MAX_ZOOM):
 # --- Local metric frame ---------------------------------------------------
 
 
+#: Names the exact projection a georeference record describes, so a reader
+#: in another language can reproduce it rather than guessing at a model.
+PROJECTION_MODEL = "local_equirectangular_wgs84_series_v1"
+#: Coordinates are plain WGS84 lat/lon, as served by the tile sources.
+PROJECTION_CRS = "EPSG:4326"
+
+#: Series coefficients for metres per degree on the WGS84 ellipsoid. They
+#: are published in the record itself, so a reader needs no outside
+#: knowledge -- and they live here as constants so the two cannot drift.
+METRES_PER_DEGREE_LAT_COEFFS = (111132.92, -559.82, 1.175, -0.0023)
+METRES_PER_DEGREE_LON_COEFFS = (111412.84, -93.5, 0.118)
+
+
 def metres_per_degree_lat(lat):
     """Length of one degree of latitude, in metres, on the WGS84 ellipsoid."""
+    a, b, c, d = METRES_PER_DEGREE_LAT_COEFFS
     phi = math.radians(lat)
-    return (111132.92
-            - 559.82 * math.cos(2 * phi)
-            + 1.175 * math.cos(4 * phi)
-            - 0.0023 * math.cos(6 * phi))
+    return (a
+            + b * math.cos(2 * phi)
+            + c * math.cos(4 * phi)
+            + d * math.cos(6 * phi))
 
 
 def metres_per_degree_lon(lat):
@@ -147,10 +161,25 @@ def metres_per_degree_lon(lat):
 
     Accepts scalars or numpy arrays, so it can be evaluated per grid row.
     """
+    a, b, c = METRES_PER_DEGREE_LON_COEFFS
     phi = np.radians(lat)
-    return (111412.84 * np.cos(phi)
-            - 93.5 * np.cos(3 * phi)
-            + 0.118 * np.cos(5 * phi))
+    return (a * np.cos(phi)
+            + b * np.cos(3 * phi)
+            + c * np.cos(5 * phi))
+
+
+def lonlat_to_local_offsets(center_lat, center_lon, lon, lat):
+    """Inverse of :func:`local_offsets_to_lonlat`.
+
+    Closed form, no iteration: longitude is scaled at the *target* latitude,
+    which is already known.
+    """
+    north = ((np.asarray(lat, dtype=np.float64) - center_lat)
+             * metres_per_degree_lat(center_lat))
+    m_per_deg_lon = metres_per_degree_lon(lat)
+    m_per_deg_lon = np.where(np.abs(m_per_deg_lon) < 1e-6, 1e-6, m_per_deg_lon)
+    east = (np.asarray(lon, dtype=np.float64) - center_lon) * m_per_deg_lon
+    return east, north
 
 
 def local_offsets_to_lonlat(center_lat, center_lon, east_m, north_m):
@@ -823,7 +852,8 @@ GEOREF_VERSION = 1
 
 
 def build_georef_record(georeference, offset_x=0, offset_z=0, tile_size=1,
-                        region_name=None, import_id=None):
+                        region_name=None, import_id=None,
+                        ocean_depth_m=20.0, keep_bathymetry=False):
     """Describe where one city tile sits in the real world.
 
     ``offset_x`` / ``offset_z`` are the tile's origin in **cells**, measured
@@ -856,10 +886,22 @@ def build_georef_record(georeference, offset_x=0, offset_z=0, tile_size=1,
             "size": int(tile_size),
             "cells": int(tile_size) * CELLS_PER_TILE,
         },
+        "projection": {
+            # Everything a reader needs to reproduce the mapping exactly.
+            "model": PROJECTION_MODEL,
+            "crs": PROJECTION_CRS,
+            "metres_per_degree_lat_coeffs": list(METRES_PER_DEGREE_LAT_COEFFS),
+            "metres_per_degree_lon_coeffs": list(METRES_PER_DEGREE_LON_COEFFS),
+        },
         "heights": {
             "sea_level_m": georeference.sea_level_m,
             "vertical_scale": georeference.vertical_scale,
             "sea_reference_m": georeference.sea_reference_m,
+            # Ground below the shoreline was flattened to a shelf unless
+            # bathymetry was kept, so the height mapping is not invertible
+            # there. Recorded so a reader knows which cells to distrust.
+            "ocean_depth_m": ocean_depth_m,
+            "keep_bathymetry": bool(keep_bathymetry),
         },
         "source": {
             "elevation": georeference.source,
@@ -922,6 +964,35 @@ def georef_cell_to_lonlat(record, cell_x, cell_z):
 
     return local_offsets_to_lonlat(frame["center_lat"], frame["center_lon"],
                                    east, north)
+
+
+def georef_lonlat_to_cell(record, lon, lat):
+    """Where a real-world point falls in the tile a record describes.
+
+    Returns fractional ``(cell_x, cell_z)`` local to the city tile, so
+    (0, 0) is its north-west corner and negative or over-size values mean
+    the point lies outside this city. This is the direction a plugin
+    actually needs -- given an OpenStreetMap node, where does it go? -- and
+    it is the exact inverse of :func:`georef_cell_to_lonlat`.
+    """
+    frame = record["frame"]
+    tile = record["tile"]
+    spacing = float(frame["metres_per_cell"])
+
+    east, north = lonlat_to_local_offsets(
+        frame["center_lat"], frame["center_lon"], lon, lat)
+
+    rotation = float(frame.get("rotation_deg", 0.0))
+    if rotation:
+        # Undo the forward rotation.
+        theta = math.radians(rotation)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        east, north = (east * cos_t - north * sin_t,
+                       east * sin_t + north * cos_t)
+
+    column = east / spacing + (float(frame["grid_width"]) - 1) / 2.0
+    row = (float(frame["grid_height"]) - 1) / 2.0 - north / spacing
+    return column - float(tile["offset_x"]), row - float(tile["offset_z"])
 
 
 # --- City tile layout -----------------------------------------------------

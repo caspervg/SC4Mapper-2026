@@ -159,23 +159,50 @@ The payload is UTF-8 JSON, a few hundred bytes:
  "version": 1,
  "frame": {
   "center_lat": 37.7955, "center_lon": -122.447,
-  "grid_width": 769, "grid_height": 769,
+  "grid_width": 257, "grid_height": 257,
   "metres_per_cell": 16.0, "rotation_deg": 0.0
  },
- "tile": { "offset_x": 256, "offset_z": 128, "size": 4, "cells": 256 },
- "heights": { "sea_level_m": 250.0, "vertical_scale": 1.0,
-              "sea_reference_m": 0.0 },
- "source": { "elevation": "...terrarium/{z}/{x}/{y}.png", "zoom": 13 }
+ "tile": { "offset_x": 0, "offset_z": 0, "size": 4, "cells": 256 },
+ "projection": {
+  "model": "local_equirectangular_wgs84_series_v1",
+  "crs": "EPSG:4326",
+  "metres_per_degree_lat_coeffs": [111132.92, -559.82, 1.175, -0.0023],
+  "metres_per_degree_lon_coeffs": [111412.84, -93.5, 0.118]
+ },
+ "heights": {
+  "sea_level_m": 250.0, "vertical_scale": 1.0, "sea_reference_m": 0.0,
+  "ocean_depth_m": 20.0, "keep_bathymetry": false
+ },
+ "source": { "elevation": "...terrarium/{z}/{x}/{y}.png", "zoom": 13 },
+ "region": "San Francisco",
+ "import_id": "b09e4cef2d014aa7a8602010c51cb158"
 }
 ```
 
 `frame` is the local metric grid the whole region was sampled on; `tile`
 says where this particular city sits inside it, in cells from the grid's
-north-west corner. Between them, a reader can turn any cell in the city
-into a latitude and longitude -- which is what a DLL plugin would need to
-line real-world data up with the terrain in game.
-`sc4mapper.geo.georef_cell_to_lonlat` is the reference implementation, and
-the tests check it against the grid the importer actually sampled.
+north-west corner. `projection` publishes the earth model *and its
+coefficients*, so a reader in another language reproduces the mapping
+exactly instead of guessing at a sphere and drifting a few cells across a
+large region.
+
+Both directions are covered, and both have reference implementations the
+tests check against the grid the importer actually sampled:
+
+- `geo.georef_cell_to_lonlat(record, cell_x, cell_z)` -- for labelling
+  terrain.
+- `geo.georef_lonlat_to_cell(record, lon, lat)` -- the direction a plugin
+  needs. Given an OpenStreetMap node, where does it go? Returns fractional
+  cells local to the tile; values outside `0 .. tile.cells` mean the point
+  belongs to a different city.
+
+Heights invert too, above the shoreline: `real = sea_reference_m +
+(in_game - sea_level_m) / vertical_scale`. Below it the ground was
+flattened to a shelf, so `ocean_depth_m` and `keep_bathymetry` are recorded
+to say which cells not to trust.
+
+`import_id` changes on every import, so a reader can cache derived data
+against it and know when a region has been re-imported underneath it.
 
 It is JSON rather than a binary format on purpose: it is small enough that
 compactness buys nothing, it can be read from any language without
