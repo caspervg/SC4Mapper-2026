@@ -225,6 +225,10 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                      ("Lowest ground in the area", "lowest"),
                      ("Elevation (m)", "manual")]
 
+    WATER_CHOICES = [("From elevation only", "elevation"),
+                     ("Add mapped water", "both"),
+                     ("Mapped water only", "mask")]
+
     def __init__(self, parent, settings):
         wx.Dialog.__init__(self, parent, -1,
                            "Create region from a real-world location",
@@ -334,6 +338,41 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self, -1, "Flood everything below the shoreline")
         self.flatten.SetValue(True)
         terrainSizer.Add(self.flatten, 0, wx.ALL, 3)
+
+        waterBox = wx.StaticBox(self, -1, "Water from OpenStreetMap")
+        waterSizer = wx.StaticBoxSizer(waterBox, wx.VERTICAL)
+        self.waterSource = wx.Choice(
+            self, -1, choices=[label for label, _ in self.WATER_CHOICES])
+        self.waterSource.SetSelection(0)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Lakes and rivers"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.waterSource, 0, wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+
+        self.minWaterArea = wx.TextCtrl(self, -1, "64", size=(60, -1))
+        self.maxWaterRise = wx.TextCtrl(self, -1, "30", size=(60, -1))
+        self.waterDepth = wx.TextCtrl(self, -1, "3", size=(60, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Ignore smaller than"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.minWaterArea, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "cells, or more than"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.maxWaterRise, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "m above the shoreline"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Water depth"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.waterDepth, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "m"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+        self.waterNote = wx.StaticText(self, -1, " ")
+        waterSizer.Add(self.waterNote, 0, wx.LEFT | wx.BOTTOM, 5)
+        self.waterSizer = waterSizer
         self.underlay = wx.CheckBox(
             self, -1, "Download a map underlay for the region view")
         hasBasemap = bool(getattr(settings, "basemap_url", ""))
@@ -349,6 +388,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         sizer.Add(findSizer, 0, wx.EXPAND | wx.ALL, 5)
         sizer.Add(shapeSizer, 0, wx.EXPAND | wx.ALL, 5)
         sizer.Add(terrainSizer, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(waterSizer, 0, wx.EXPAND | wx.ALL, 5)
         sizer.Add(wx.StaticLine(self, -1, size=(20, -1),
                                 style=wx.LI_HORIZONTAL), 0, wx.GROW | wx.ALL, 5)
         btnsizer = wx.StdDialogButtonSizer()
@@ -369,6 +409,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.citySize.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.verticalMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.datumMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.waterSource.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.OnShapeChanged(None)
 
     # -- helpers ----------------------------------------------------------
@@ -407,6 +448,26 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             % (width, height, ", ".join(parts) if parts else "no cities"))
         self.UpdateVerticalNote(metres)
         self.UpdateDatumNote()
+        self.UpdateWaterNote()
+
+    def UpdateWaterNote(self):
+        """Explain the OpenStreetMap water options."""
+        mode = self.GetWaterSource()
+        for control in (self.minWaterArea, self.maxWaterRise, self.waterDepth):
+            control.Enable(mode != "elevation")
+        notes = {
+            "elevation": "Water is decided by the shoreline alone. No lookup "
+                         "is made.",
+            "both": "Lakes and rivers from OpenStreetMap are added to what "
+                    "the shoreline already floods. Best for the coast.",
+            "mask": "Only mapped water is wet; everything else is raised to "
+                    "dry land however low it sits. Use for polders.",
+        }
+        self.waterNote.SetLabel(notes[mode])
+
+    def GetWaterSource(self):
+        index = max(0, self.waterSource.GetSelection())
+        return self.WATER_CHOICES[index][1]
 
     def UpdateDatumNote(self):
         """Explain which real elevation becomes SimCity 4's shoreline."""
@@ -501,6 +562,9 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         rotation = self._float(self.rotation, "Rotation", 0.0)
         vertical = self._float(self.vertical, "Vertical exaggeration", 1.0)
         datum = self._float(self.datum, "Shoreline elevation", 0.0)
+        minArea = self._float(self.minWaterArea, "Minimum water size", 64.0)
+        maxRise = self._float(self.maxWaterRise, "Maximum water rise", 30.0)
+        depth = self._float(self.waterDepth, "Water depth", 3.0)
         request = geo.GeoImportRequest(
             center_lat=lat,
             center_lon=lon,
@@ -512,6 +576,10 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             vertical_scale=vertical,
             water_datum_mode=self.GetDatumMode(),
             sea_reference_m=datum,
+            water_source=self.GetWaterSource(),
+            min_water_area_cells=int(max(0.0, minArea)),
+            max_water_rise_m=max(0.0, maxRise),
+            water_depth_m=max(0.1, depth),
             keep_bathymetry=not self.flatten.GetValue(),
         )
         try:
@@ -1671,10 +1739,16 @@ class OverView(wx.Frame):
 
         basemap = None
         try:
+            waterMask = None
+            if request.water_source != "elevation":
+                water = geo.OverpassClient(
+                    cache_dir=os.path.join(cacheDir, "osm") if cacheDir else None)
+                waterMask = geo.fetch_water_mask(request, water, report)
             fetcher = geo.HttpTileFetcher(
                 url_template=elevationUrl,
                 cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None)
-            result = geo.build_region_grid(request, fetcher, report)
+            result = geo.build_region_grid(request, fetcher, report,
+                                           water_mask=waterMask)
             if wantUnderlay:
                 report(0, 100, "Downloading the map underlay")
                 mapFetcher = geo.HttpTileFetcher(

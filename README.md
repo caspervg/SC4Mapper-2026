@@ -107,11 +107,51 @@ So the setting has three modes: *Real sea level*, *Lowest ground in the
 area*, and an explicit elevation. The import reports how much of the region
 ended up under water, which is the quickest way to tell you picked wrong.
 
-One limitation worth knowing: a single shoreline elevation cannot separate
-water from low land. Two lakes at different heights need a compromise
-value, and in the Netherlands the canals import as land along with the
-polders. Distinguishing them properly needs a water mask rather than a
-datum, which this importer does not do.
+A single shoreline elevation cannot separate water from low land, though:
+two lakes at different heights need a compromise value, and in the
+Netherlands the canals would import as land along with the polders. That is
+what the water mask below is for.
+
+### Water From OpenStreetMap
+
+Under **Water from OpenStreetMap**, lakes and rivers can be looked up
+directly rather than inferred from elevation. Two rules are applied, and
+both matter:
+
+- Mapped water is pushed below the waterline.
+- Everything else is *raised above* it, however low it really sits.
+
+The second rule is what makes a polder work. Together they cut the wet/dry
+question loose from elevation entirely, which a shoreline datum can never
+do. Interlaken imports with both lakes at their real outlines and the
+valley between them dry, without tuning a datum at all; Amsterdam imports
+with its waterways wet and its polders dry.
+
+Three settings:
+
+- **From elevation only** -- no lookup, the behaviour above.
+- **Add mapped water** -- mapped water on top of whatever the shoreline
+  already floods. Right for the coast, where the sea comes from elevation.
+- **Mapped water only** -- the map is the whole truth. Use where elevation
+  lies about water, which is anywhere built on land below sea level.
+
+Two filters guard against nonsense, both adjustable:
+
+- **Ignore smaller than N cells** drops creeks and ponds too small to read.
+- **...or more than N m above the shoreline** is the important one. SimCity
+  4 has exactly one water level, so a body only makes sense as water if it
+  already sits near it. Flooding a stream several hundred metres up gouges a
+  canyon straight down the mountain -- in testing, an alpine creek carved a
+  579 m trench before this filter existed. Bodies too high are left as
+  terrain, because they simply are not representable.
+
+![Interlaken with both lakes from mapped water](doc/geo/water-mask-lakes.jpg)
+
+Queries go to Overpass, which is volunteer-run: one request per import,
+cached on disk afterwards, so re-importing an area is free and offline.
+Coastlines are deliberately not fetched -- OSM tags them as open ways with
+land on the left rather than closed polygons, and the sea is the one case
+elevation already handles well.
 
 ### Laying Out City Tiles
 

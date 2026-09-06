@@ -415,6 +415,16 @@ class GeoImportRequest:
     ocean_depth_m: float = 20.0
     keep_bathymetry: bool = False
     despike_threshold_m: float = 200.0
+    #: How water is decided. "elevation" uses the shoreline datum alone;
+    #: "mask" trusts an OpenStreetMap water mask and makes everything else
+    #: dry, whatever its elevation; "both" takes the union.
+    water_source: str = "elevation"
+    water_depth_m: float = 3.0
+    #: Water bodies smaller than this are ignored, and any sitting more than
+    #: min_water_rise_m above the shoreline are left as terrain rather than
+    #: carved down to it.
+    min_water_area_cells: int = 64
+    max_water_rise_m: float = 30.0
     max_zoom: int = 14
     zoom: Optional[int] = None
 
@@ -463,6 +473,9 @@ class GeoImportRequest:
         if self.water_datum_mode not in ("sea", "lowest", "manual"):
             raise GeoImportError(
                 "Water datum mode must be 'sea', 'lowest' or 'manual'")
+        if self.water_source not in ("elevation", "mask", "both"):
+            raise GeoImportError(
+                "Water source must be 'elevation', 'mask' or 'both'")
 
     @property
     def grid_shape(self):
@@ -483,6 +496,10 @@ class GeoImportResult:
     tiles_missing: int = 0
     clamped_vertices: int = 0
     despiked_vertices: int = 0
+    water_cells: int = 0
+    lifted_cells: int = 0
+    water_bodies: int = 0
+    dropped_water_bodies: int = 0
     water_fraction: float = 0.0
     slopes: dict = None
     attribution: str = DEFAULT_ATTRIBUTION
@@ -519,6 +536,12 @@ class GeoImportResult:
                    self.slopes["p95_grade"] * 100,
                    self.slopes["steep_fraction"] * 100,
                    STEEP_GRADE * 100))
+        if self.water_cells or self.lifted_cells or self.dropped_water_bodies:
+            lines.append(
+                "Mapped water: %d body(s) used, %d skipped as too small or "
+                "too far above the waterline; %d vertex(es) flooded, %d "
+                "lifted clear" % (self.water_bodies, self.dropped_water_bodies,
+                                  self.water_cells, self.lifted_cells))
         if self.despiked_vertices:
             lines.append("%d source artifact(s) smoothed away"
                          % self.despiked_vertices)
@@ -790,8 +813,24 @@ def slope_statistics(height_dm, steep_grade=STEEP_GRADE):
     }
 
 
-def build_region_grid(request, fetcher, progress=None):
-    """Fetch, project and convert -- the whole import in one call."""
+def fetch_water_mask(request, client, progress=None):
+    """Fetch water areas for a region and burn them onto its grid."""
+    if progress is not None:
+        progress(0, 1, "Looking up water from OpenStreetMap")
+    query = build_water_query(region_bbox(request))
+    data = client.fetch(query)
+    outers, inners = parse_overpass_water(data)
+    if progress is not None:
+        progress(1, 1, "Tracing %d water outline(s)" % len(outers))
+    return rasterize_water(request, outers, inners)
+
+
+def build_region_grid(request, fetcher, progress=None, water_mask=None):
+    """Fetch, project and convert -- the whole import in one call.
+
+    ``water_mask`` is an optional boolean grid from
+    :func:`fetch_water_mask`, applied according to ``request.water_source``.
+    """
     elevation, zoom, fetched, missing = sample_elevation(request, fetcher, progress)
     elevation, despiked = despike_elevation(elevation, request.despike_threshold_m)
     vertical_scale = request.effective_vertical_scale()
@@ -804,6 +843,30 @@ def build_region_grid(request, fetcher, progress=None):
         ocean_depth_m=request.ocean_depth_m,
         keep_bathymetry=request.keep_bathymetry,
     )
+    water_cells = 0
+    lifted_cells = 0
+    water_bodies = 0
+    dropped_water_bodies = 0
+    if water_mask is not None and request.water_source != "elevation":
+        if request.water_source == "both":
+            # Keep what the datum already flooded -- the sea, usually --
+            # and add the mapped water on top of it.
+            effective = np.asarray(water_mask, dtype=bool) | (
+                height_dm < request.sea_level_m * 10)
+        else:
+            # The mask is the whole truth: anything unmapped becomes land,
+            # however low it sits.
+            effective = np.asarray(water_mask, dtype=bool)
+        effective, kept, small, high = filter_water_bodies(
+            effective, height_dm, sea_level_m=request.sea_level_m,
+            min_area_cells=request.min_water_area_cells,
+            max_rise_m=request.max_water_rise_m)
+        dropped_water_bodies = small + high
+        water_bodies = kept
+        height_dm, water_cells, lifted_cells = apply_water_mask(
+            height_dm, effective, sea_level_m=request.sea_level_m,
+            water_depth_m=request.water_depth_m)
+
     georeference = GeoReference(
         center_lat=request.center_lat,
         center_lon=request.center_lon,
@@ -825,10 +888,341 @@ def build_region_grid(request, fetcher, progress=None):
         tiles_missing=missing,
         clamped_vertices=clamped,
         despiked_vertices=despiked,
+        water_cells=water_cells,
+        lifted_cells=lifted_cells,
+        water_bodies=water_bodies,
+        dropped_water_bodies=dropped_water_bodies,
         slopes=slope_statistics(height_dm),
         water_fraction=float(np.count_nonzero(height_dm < request.sea_level_m * 10)
                              / height_dm.size),
     )
+
+
+# --- Water mask -----------------------------------------------------------
+
+#: Overpass mirrors are volunteer-run and rate limited. One query per import,
+#: cached to disk afterwards, is well within what they ask for.
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+#: Tags that describe a body of water as an *area*.
+#:
+#: Coastline is deliberately absent. It is tagged as open ways with land on
+#: the left rather than closed polygons, and turning that into a sea polygon
+#: means assembling and clipping it against the region -- a job in itself.
+#: The sea is also the one case elevation already handles well, so the mask
+#: covers what elevation cannot: inland water, and water sitting on ground
+#: below sea level.
+WATER_AREA_TAGS = (
+    ("natural", "water"),
+    ("waterway", "riverbank"),
+    ("landuse", "reservoir"),
+    ("landuse", "basin"),
+)
+
+
+def build_water_query(bbox, timeout=90):
+    """Overpass QL selecting water areas within ``bbox``.
+
+    ``bbox`` is ``(south, west, north, east)``, the order Overpass uses.
+    """
+    south, west, north, east = bbox
+    box = "%.6f,%.6f,%.6f,%.6f" % (south, west, north, east)
+    clauses = []
+    for key, value in WATER_AREA_TAGS:
+        clauses.append('way["%s"="%s"](%s);' % (key, value, box))
+        clauses.append('relation["%s"="%s"](%s);' % (key, value, box))
+    return ("[out:json][timeout:%d];\n(\n  %s\n);\nout geom;"
+            % (int(timeout), "\n  ".join(clauses)))
+
+
+def region_bbox(request, margin_cells=2):
+    """Bounding box of a region as ``(south, west, north, east)``.
+
+    A small margin keeps water that laps over the edge from being clipped
+    into a straight line at the boundary.
+    """
+    lon, lat = grid_lonlat(request)
+    margin_deg_lat = (margin_cells * request.metres_per_cell
+                      / metres_per_degree_lat(request.center_lat))
+    margin_deg_lon = (margin_cells * request.metres_per_cell
+                      / float(metres_per_degree_lon(request.center_lat)))
+    return (float(lat.min()) - margin_deg_lat,
+            float(lon.min()) - margin_deg_lon,
+            float(lat.max()) + margin_deg_lat,
+            float(lon.max()) + margin_deg_lon)
+
+
+class OverpassClient:
+    """Fetch water areas from Overpass, cached on disk.
+
+    Responses are cached under a hash of the query, so re-importing the same
+    area costs nothing and works offline. ``opener`` exists so tests (and
+    anyone wanting a different transport) can substitute the network call.
+    """
+
+    def __init__(self, url=OVERPASS_URL, cache_dir=None, timeout=180,
+                 user_agent=None, opener=None):
+        self.url = url
+        self.cache_dir = cache_dir
+        self.timeout = timeout
+        self.user_agent = user_agent or (
+            "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)")
+        self.opener = opener
+
+    def _cache_path(self, query):
+        if not self.cache_dir:
+            return None
+        import hashlib
+        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:32]
+        return os.path.join(self.cache_dir, digest + ".json")
+
+    def fetch(self, query):
+        """Return the decoded Overpass response for a query."""
+        import json
+
+        path = self._cache_path(query)
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                try:
+                    return json.load(fh)
+                except ValueError:
+                    pass  # a truncated cache entry; refetch below
+
+        if self.opener is not None:
+            payload = self.opener(self.url, query)
+        else:
+            request = urllib.request.Request(
+                self.url,
+                data=urllib.parse.urlencode({"data": query}).encode("utf-8"),
+                headers={"User-Agent": self.user_agent})
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    payload = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 504):
+                    raise GeoImportError(
+                        "The OpenStreetMap query service is busy (HTTP %d). "
+                        "Wait a minute and try again." % exc.code) from exc
+                raise GeoImportError(
+                    "OpenStreetMap query failed with HTTP %d" % exc.code) from exc
+            except urllib.error.URLError as exc:
+                raise GeoImportError(
+                    "Could not reach the OpenStreetMap query service (%s)."
+                    % getattr(exc, "reason", exc)) from exc
+
+        try:
+            data = json.loads(payload) if isinstance(payload, (bytes, str)) else payload
+        except ValueError as exc:
+            raise GeoImportError(
+                "The OpenStreetMap query service returned an unreadable reply"
+            ) from exc
+
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".part"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        return data
+
+
+def parse_overpass_water(data):
+    """Pull water rings out of an Overpass ``out geom`` response.
+
+    Returns ``(outers, inners)``: two lists of rings, each ring a list of
+    ``(lon, lat)``. Inner rings are the holes in multipolygons -- islands --
+    and are punched back out after the outers are filled.
+    """
+    outers = []
+    inners = []
+    if not isinstance(data, dict):
+        return outers, inners
+
+    for element in data.get("elements", []) or []:
+        if not isinstance(element, dict):
+            continue
+        kind = element.get("type")
+        if kind == "way":
+            ring = [(float(p["lon"]), float(p["lat"]))
+                    for p in element.get("geometry", []) or []
+                    if isinstance(p, dict) and "lon" in p and "lat" in p]
+            if len(ring) >= 3:
+                outers.append(ring)
+        elif kind == "relation":
+            for member in element.get("members", []) or []:
+                if not isinstance(member, dict):
+                    continue
+                ring = [(float(p["lon"]), float(p["lat"]))
+                        for p in member.get("geometry", []) or []
+                        if isinstance(p, dict) and "lon" in p and "lat" in p]
+                if len(ring) < 3:
+                    continue
+                if member.get("role") == "inner":
+                    inners.append(ring)
+                else:
+                    outers.append(ring)
+    return outers, inners
+
+
+def rasterize_water(request, outers, inners=(), fetcher_shape=None):
+    """Burn water rings onto the region grid.
+
+    Returns a boolean array shaped like the height grid, True where water
+    covers the ground. Rings are projected through the same local frame the
+    terrain was sampled on, so the mask lands exactly on the right cells.
+    """
+    from PIL import ImageDraw
+
+    rows, cols = fetcher_shape or request.grid_shape
+    canvas = Image.new("1", (cols, rows), 0)
+
+    def to_pixels(ring):
+        lons = np.array([p[0] for p in ring], dtype=np.float64)
+        lats = np.array([p[1] for p in ring], dtype=np.float64)
+        east, north = lonlat_to_local_offsets(
+            request.center_lat, request.center_lon, lons, lats)
+        if request.rotation_deg:
+            theta = math.radians(request.rotation_deg)
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            east, north = (east * cos_t - north * sin_t,
+                           east * sin_t + north * cos_t)
+        column = east / request.metres_per_cell + (cols - 1) / 2.0
+        row = (rows - 1) / 2.0 - north / request.metres_per_cell
+        return list(zip(column.tolist(), row.tolist()))
+
+    draw = ImageDraw.Draw(canvas)
+    for ring in outers:
+        points = to_pixels(ring)
+        if len(points) >= 3:
+            draw.polygon(points, fill=1, outline=1)
+    for ring in inners:
+        points = to_pixels(ring)
+        if len(points) >= 3:
+            draw.polygon(points, fill=0, outline=0)
+
+    return np.array(canvas, dtype=bool)
+
+
+def label_water_bodies(mask):
+    """Label connected runs of water. Returns ``(labels, count)``.
+
+    Four-connected, iterative, and numpy-only -- SC4Mapper deliberately has
+    no SciPy dependency. Only masked cells are visited, so the cost tracks
+    the amount of water rather than the size of the region.
+    """
+    from collections import deque
+
+    mask = np.asarray(mask, dtype=bool)
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    rows, cols = mask.shape
+    count = 0
+
+    for start_r in range(rows):
+        row_mask = mask[start_r]
+        if not row_mask.any():
+            continue
+        for start_c in np.flatnonzero(row_mask):
+            if labels[start_r, start_c]:
+                continue
+            count += 1
+            queue = deque([(start_r, int(start_c))])
+            labels[start_r, start_c] = count
+            while queue:
+                r, c = queue.popleft()
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols:
+                        if mask[nr, nc] and not labels[nr, nc]:
+                            labels[nr, nc] = count
+                            queue.append((nr, nc))
+    return labels, count
+
+
+def filter_water_bodies(mask, height_dm, sea_level_m=SEA_LEVEL_M,
+                        min_area_cells=64, max_rise_m=30.0):
+    """Drop water bodies that would wreck the terrain if flooded.
+
+    SimCity 4 has exactly one water level, so a mapped body only makes
+    sense as water if it already sits near it. Carving one down from higher
+    up gouges a canyon: an alpine stream several hundred metres above the
+    shoreline would be cut straight through the mountain it runs down.
+    Bodies whose surface sits more than ``max_rise_m`` above the waterline
+    are therefore left as terrain -- they are simply not representable.
+
+    ``min_area_cells`` drops the specks: creeks a cell or two wide, and
+    ponds too small to read as water once they are on the map.
+
+    Returns ``(mask, kept, dropped_small, dropped_high)``.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    heights = np.asarray(height_dm, dtype=np.float64)
+    if heights.shape != mask.shape:
+        raise GeoImportError(
+            "Water mask is %s but the region is %s" % (mask.shape, heights.shape))
+    if not mask.any():
+        return mask, 0, 0, 0
+
+    # Either filter can be switched off by passing None (or 0 for the area).
+    ceiling = None
+    if max_rise_m is not None:
+        ceiling = sea_level_m * 10.0 + float(max_rise_m) * 10.0
+    minimum_area = int(min_area_cells or 0)
+
+    labels, count = label_water_bodies(mask)
+    keep = np.zeros(mask.shape, dtype=bool)
+    kept = dropped_small = dropped_high = 0
+
+    for label in range(1, count + 1):
+        body = labels == label
+        area = int(np.count_nonzero(body))
+        if area < minimum_area:
+            dropped_small += 1
+            continue
+        # The median is robust to a few stray cells clipped off a bank.
+        if ceiling is not None and np.median(heights[body]) > ceiling:
+            dropped_high += 1
+            continue
+        keep |= body
+        kept += 1
+
+    return keep, kept, dropped_small, dropped_high
+
+
+def apply_water_mask(height_dm, mask, sea_level_m=SEA_LEVEL_M,
+                     water_depth_m=3.0, land_margin_m=0.5, lift_land=True):
+    """Force water where the mask says water, and dry land where it does not.
+
+    Both halves matter. Pushing masked ground under the waterline is the
+    obvious one; lifting everything else *above* it is what finally makes a
+    polder work -- ground that really does sit below sea level but is dry.
+    Together they cut the wet/dry question loose from elevation, which a
+    shoreline datum alone can never do.
+
+    Returns ``(height_dm, wet_count, lifted_count)``.
+    """
+    heights = np.array(height_dm, dtype=np.int64)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != heights.shape:
+        raise GeoImportError(
+            "Water mask is %s but the region is %s"
+            % (mask.shape, heights.shape))
+
+    waterline = int(round(sea_level_m * 10))
+    bed = waterline - int(round(water_depth_m * 10))
+
+    wet_before = heights >= waterline
+    heights = np.where(mask, np.minimum(heights, bed), heights)
+    wet_count = int(np.count_nonzero(mask & wet_before))
+
+    lifted_count = 0
+    if lift_land:
+        shore = waterline + int(round(land_margin_m * 10))
+        needs_lift = (~mask) & (heights < waterline)
+        lifted_count = int(np.count_nonzero(needs_lift))
+        heights = np.where(needs_lift, np.maximum(heights, shore), heights)
+
+    heights = np.clip(heights, 0, 65535)
+    return heights.astype(np.uint16), wet_count, lifted_count
 
 
 # --- Georeference sidecar -------------------------------------------------
