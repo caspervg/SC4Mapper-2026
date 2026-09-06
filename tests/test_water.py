@@ -66,8 +66,19 @@ def test_query_asks_for_json_and_geometry():
 def test_query_covers_the_water_tags():
     query = geo.build_water_query((0, 0, 1, 1))
     for key, value in geo.WATER_AREA_TAGS:
-        assert 'way["%s"="%s"]' % (key, value) in query
-        assert 'relation["%s"="%s"]' % (key, value) in query
+        assert "way[%s=%s]" % (key, value) in query
+        assert "relation[%s=%s]" % (key, value) in query
+
+
+def test_query_avoids_quoted_tag_values():
+    """overpass-api.de answers 406 to some requests carrying quotes.
+
+    Overpass QL allows unquoted filters for plain identifiers, and every
+    tag used here qualifies, so the quotes are pure risk.
+    """
+    query = geo.build_water_query((0, 0, 1, 1))
+    assert '"' not in query
+    assert "'" not in query
 
 
 def test_query_is_a_union_block():
@@ -477,3 +488,94 @@ def test_summary_mentions_skipped_bodies():
     mask[3, 3] = True
     result = geo.build_region_grid(req, ConstantFetcher(20.0), water_mask=mask)
     assert "skipped" in result.summary()
+
+
+# --- mirrors --------------------------------------------------------------
+
+
+def test_client_defaults_to_the_mirror_list():
+    client = geo.OverpassClient()
+    assert client.mirrors == list(geo.OVERPASS_MIRRORS)
+    assert len(client.mirrors) > 1
+
+
+def test_explicit_url_pins_one_endpoint():
+    client = geo.OverpassClient(url="https://example.test/api")
+    assert client.mirrors == ["https://example.test/api"]
+
+
+def test_a_406_moves_on_to_the_next_mirror():
+    """The failure this exists for: the main instance rejecting a request."""
+    import urllib.error
+
+    tried = []
+
+    def fake_urlopen(request, timeout=None):
+        tried.append(request.full_url)
+        if len(tried) == 1:
+            raise urllib.error.HTTPError(request.full_url, 406,
+                                         "Not Acceptable", {}, None)
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"elements": []}'
+
+        return Response()
+
+    import sc4mapper.geo as geomod
+    original = geomod.urllib.request.urlopen
+    geomod.urllib.request.urlopen = fake_urlopen
+    try:
+        client = geo.OverpassClient()
+        assert client.fetch(geo.build_water_query((0, 0, 1, 1))) == {"elements": []}
+    finally:
+        geomod.urllib.request.urlopen = original
+
+    assert len(tried) == 2
+    assert tried[0] != tried[1]
+
+
+def test_all_mirrors_failing_reports_each():
+    import urllib.error
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 429, "Too Many", {}, None)
+
+    import sc4mapper.geo as geomod
+    original = geomod.urllib.request.urlopen
+    geomod.urllib.request.urlopen = fake_urlopen
+    try:
+        with pytest.raises(geo.GeoImportError) as excinfo:
+            geo.OverpassClient().fetch(geo.build_water_query((0, 0, 1, 1)))
+    finally:
+        geomod.urllib.request.urlopen = original
+    message = str(excinfo.value)
+    for url in geo.OVERPASS_MIRRORS:
+        assert url in message
+
+
+def test_a_client_error_does_not_hammer_every_mirror():
+    """A malformed query fails the same way everywhere; ask once."""
+    import urllib.error
+
+    tried = []
+
+    def fake_urlopen(request, timeout=None):
+        tried.append(request.full_url)
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, None)
+
+    import sc4mapper.geo as geomod
+    original = geomod.urllib.request.urlopen
+    geomod.urllib.request.urlopen = fake_urlopen
+    try:
+        with pytest.raises(geo.GeoImportError):
+            geo.OverpassClient().fetch(geo.build_water_query((0, 0, 1, 1)))
+    finally:
+        geomod.urllib.request.urlopen = original
+    assert len(tried) == 1

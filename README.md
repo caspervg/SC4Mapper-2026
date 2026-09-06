@@ -149,6 +149,9 @@ Two filters guard against nonsense, both adjustable:
 
 Queries go to Overpass, which is volunteer-run: one request per import,
 cached on disk afterwards, so re-importing an area is free and offline.
+Tag filters are written unquoted, because overpass-api.de currently
+answers 406 Not Acceptable to some requests carrying quoted values, and
+the request falls through to a mirror if the first endpoint refuses it.
 Coastlines are deliberately not fetched -- OSM tags them as open ways with
 land on the left rather than closed polygons, and the sea is the one case
 elevation already handles well.

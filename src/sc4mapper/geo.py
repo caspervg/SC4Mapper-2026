@@ -902,7 +902,14 @@ def build_region_grid(request, fetcher, progress=None, water_mask=None):
 
 #: Overpass mirrors are volunteer-run and rate limited. One query per import,
 #: cached to disk afterwards, is well within what they ask for.
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+#:
+#: Tried in order. The main instance currently answers 406 to some
+#: otherwise valid requests, so a second endpoint is not a luxury.
+OVERPASS_MIRRORS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
+OVERPASS_URL = OVERPASS_MIRRORS[0]
 
 #: Tags that describe a body of water as an *area*.
 #:
@@ -929,8 +936,12 @@ def build_water_query(bbox, timeout=90):
     box = "%.6f,%.6f,%.6f,%.6f" % (south, west, north, east)
     clauses = []
     for key, value in WATER_AREA_TAGS:
-        clauses.append('way["%s"="%s"](%s);' % (key, value, box))
-        clauses.append('relation["%s"="%s"](%s);' % (key, value, box))
+        # Unquoted tag filters. Overpass QL allows them for plain
+        # identifiers, and overpass-api.de currently rejects some requests
+        # carrying quoted values with a 406, which is indistinguishable
+        # from the service being down.
+        clauses.append("way[%s=%s](%s);" % (key, value, box))
+        clauses.append("relation[%s=%s](%s);" % (key, value, box))
     return ("[out:json][timeout:%d];\n(\n  %s\n);\nout geom;"
             % (int(timeout), "\n  ".join(clauses)))
 
@@ -960,9 +971,12 @@ class OverpassClient:
     anyone wanting a different transport) can substitute the network call.
     """
 
-    def __init__(self, url=OVERPASS_URL, cache_dir=None, timeout=180,
-                 user_agent=None, opener=None):
-        self.url = url
+    def __init__(self, url=None, cache_dir=None, timeout=180,
+                 user_agent=None, opener=None, mirrors=None):
+        # An explicit url pins that endpoint; otherwise work down the
+        # mirror list, since the main instance is not always answering.
+        self.mirrors = ([url] if url else list(mirrors or OVERPASS_MIRRORS))
+        self.url = self.mirrors[0]
         self.cache_dir = cache_dir
         self.timeout = timeout
         self.user_agent = user_agent or (
@@ -975,6 +989,31 @@ class OverpassClient:
         import hashlib
         digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:32]
         return os.path.join(self.cache_dir, digest + ".json")
+
+    def _fetch_from_mirrors(self, query):
+        """Try each endpoint in turn, returning the first that answers."""
+        body = urllib.parse.urlencode({"data": query}).encode("utf-8")
+        headers = {"User-Agent": self.user_agent,
+                   "Accept": "application/json"}
+        problems = []
+        for url in self.mirrors:
+            request = urllib.request.Request(url, data=body, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    self.url = url
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                problems.append("%s: HTTP %d" % (url, exc.code))
+                # 406, 429 and 504 are all "this mirror, right now" --
+                # worth asking the next one.
+                if exc.code not in (406, 429, 502, 503, 504):
+                    break
+            except urllib.error.URLError as exc:
+                problems.append("%s: %s" % (url, getattr(exc, "reason", exc)))
+
+        raise GeoImportError(
+            "Could not reach an OpenStreetMap query service. Tried:\n  "
+            + "\n  ".join(problems))
 
     def fetch(self, query):
         """Return the decoded Overpass response for a query."""
@@ -991,24 +1030,7 @@ class OverpassClient:
         if self.opener is not None:
             payload = self.opener(self.url, query)
         else:
-            request = urllib.request.Request(
-                self.url,
-                data=urllib.parse.urlencode({"data": query}).encode("utf-8"),
-                headers={"User-Agent": self.user_agent})
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    payload = response.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code in (429, 504):
-                    raise GeoImportError(
-                        "The OpenStreetMap query service is busy (HTTP %d). "
-                        "Wait a minute and try again." % exc.code) from exc
-                raise GeoImportError(
-                    "OpenStreetMap query failed with HTTP %d" % exc.code) from exc
-            except urllib.error.URLError as exc:
-                raise GeoImportError(
-                    "Could not reach the OpenStreetMap query service (%s)."
-                    % getattr(exc, "reason", exc)) from exc
+            payload = self._fetch_from_mirrors(query)
 
         try:
             data = json.loads(payload) if isinstance(payload, (bytes, str)) else payload
