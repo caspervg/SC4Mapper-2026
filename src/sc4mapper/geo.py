@@ -377,12 +377,33 @@ class GeoImportRequest:
     vertical_mode: str = "match"
     vertical_scale: float = 1.0
     sea_level_m: float = SEA_LEVEL_M
+    #: Which real-world elevation becomes SC4's shoreline. "sea" uses real
+    #: sea level, "lowest" drops the datum below the lowest ground in the
+    #: area so everything imports as dry land, and "manual" uses
+    #: sea_reference_m as given.
+    water_datum_mode: str = "sea"
     sea_reference_m: float = 0.0
     ocean_depth_m: float = 20.0
     keep_bathymetry: bool = False
     despike_threshold_m: float = 200.0
     max_zoom: int = 14
     zoom: Optional[int] = None
+
+    def effective_water_datum(self, elevation_m=None):
+        """The real elevation that becomes SC4's shoreline.
+
+        "lowest" needs the sampled ground to work from, so it is resolved
+        once the elevation grid exists; before then it falls back to the
+        configured value.
+        """
+        if self.water_datum_mode == "sea":
+            return 0.0
+        if self.water_datum_mode == "lowest":
+            if elevation_m is None:
+                return self.sea_reference_m
+            # A margin below the lowest ground, so nothing floods.
+            return float(np.min(elevation_m)) - 1.0
+        return self.sea_reference_m
 
     def effective_vertical_scale(self):
         """The vertical scale actually applied, after resolving the mode."""
@@ -410,6 +431,9 @@ class GeoImportRequest:
         if self.vertical_mode not in ("match", "true", "manual"):
             raise GeoImportError(
                 "Vertical mode must be 'match', 'true' or 'manual'")
+        if self.water_datum_mode not in ("sea", "lowest", "manual"):
+            raise GeoImportError(
+                "Water datum mode must be 'sea', 'lowest' or 'manual'")
 
     @property
     def grid_shape(self):
@@ -430,6 +454,7 @@ class GeoImportResult:
     tiles_missing: int = 0
     clamped_vertices: int = 0
     despiked_vertices: int = 0
+    water_fraction: float = 0.0
     slopes: dict = None
     attribution: str = DEFAULT_ATTRIBUTION
 
@@ -449,7 +474,12 @@ class GeoImportResult:
             % (geo.width_m / 1000.0, geo.height_m / 1000.0, geo.metres_per_cell),
             "Elevation: %.0f m to %.0f m (real world)"
             % (self.min_elevation_m, self.max_elevation_m),
-            "Vertical scale: %.2fx" % geo.vertical_scale,
+            "Vertical scale: %.2fx, shoreline at %.0f m real"
+            % (geo.vertical_scale, geo.sea_reference_m),
+            "In game: %.0f m to %.0f m, %.0f%% under water"
+            % (float(self.height_dm.min()) / 10.0,
+               float(self.height_dm.max()) / 10.0,
+               self.water_fraction * 100),
             "Source zoom %d, %d tiles" % (self.zoom, self.tiles_fetched),
         ]
         if self.slopes:
@@ -736,11 +766,12 @@ def build_region_grid(request, fetcher, progress=None):
     elevation, zoom, fetched, missing = sample_elevation(request, fetcher, progress)
     elevation, despiked = despike_elevation(elevation, request.despike_threshold_m)
     vertical_scale = request.effective_vertical_scale()
+    sea_reference = request.effective_water_datum(elevation)
     height_dm, clamped = elevation_to_height_dm(
         elevation,
         sea_level_m=request.sea_level_m,
         vertical_scale=vertical_scale,
-        sea_reference_m=request.sea_reference_m,
+        sea_reference_m=sea_reference,
         ocean_depth_m=request.ocean_depth_m,
         keep_bathymetry=request.keep_bathymetry,
     )
@@ -753,7 +784,7 @@ def build_region_grid(request, fetcher, progress=None):
         rotation_deg=request.rotation_deg,
         sea_level_m=request.sea_level_m,
         vertical_scale=vertical_scale,
-        sea_reference_m=request.sea_reference_m,
+        sea_reference_m=sea_reference,
         zoom=zoom,
     )
     return GeoImportResult(
@@ -766,6 +797,8 @@ def build_region_grid(request, fetcher, progress=None):
         clamped_vertices=clamped,
         despiked_vertices=despiked,
         slopes=slope_statistics(height_dm),
+        water_fraction=float(np.count_nonzero(height_dm < request.sea_level_m * 10)
+                             / height_dm.size),
     )
 
 

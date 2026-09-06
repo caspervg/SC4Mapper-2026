@@ -71,16 +71,47 @@ canyon rather than anything the importer did wrong.
 
 Two other things the importer does automatically:
 
-- **Sea level** is SimCity 4's 250 m datum. Everything below the real
-  shoreline is flattened to a shallow shelf by default, because scaled
-  ocean bathymetry (which reaches several kilometres down) would otherwise
-  bottom out as a vast pit. Untick to keep the real sea floor.
+- **Ocean depth is capped.** Scaled bathymetry reaches several kilometres
+  down and would otherwise bottom out as a vast pit, so everything below
+  the shoreline is flattened to a shallow shelf. Untick *Flood everything
+  below the shoreline* to keep the real sea floor.
 - **Artifacts are removed.** Global DEM mosaics carry occasional junk
   pixels; the tile covering the sea off Hong Kong, for instance, holds a
   handful of 5000-6000 m readings. Samples that sit more than 200 m from
   their local median are replaced, which takes out the needles while
   leaving cliffs and ridge lines alone. The import reports how many it
   found.
+
+### The Shoreline
+
+SimCity 4's water sits at a fixed 250 m, so the importer instead chooses
+**which real elevation becomes that shoreline**. Getting it wrong is not
+subtle:
+
+- **Real sea level** is right on the coast. An 8 km square of San Francisco
+  imports 35% under water, which is the Pacific and the Bay.
+- Inland it fails badly. Interlaken's valley floor is at 553 m, so real sea
+  level leaves the whole region 300 m above the shoreline with no water at
+  all — Lake Thun and Lake Brienz import as dry land. Setting the shoreline
+  to 565 m puts both lakes back in the water with the town on the isthmus
+  between them.
+
+![Interlaken with the shoreline set to 565 m](doc/geo/shoreline-alpine-lakes.jpg)
+
+- It also fails below sea level. Dutch polders sit around −5 m but are dry
+  land; at real sea level, 15% of an Amsterdam import floods, taking
+  Schiphol with it. **Lowest ground in the area** drops the shoreline under
+  everything so the region imports dry.
+
+So the setting has three modes: *Real sea level*, *Lowest ground in the
+area*, and an explicit elevation. The import reports how much of the region
+ended up under water, which is the quickest way to tell you picked wrong.
+
+One limitation worth knowing: a single shoreline elevation cannot separate
+water from low land. Two lakes at different heights need a compromise
+value, and in the Netherlands the canals import as land along with the
+polders. Distinguishing them properly needs a water mask rather than a
+datum, which this importer does not do.
 
 ### Laying Out City Tiles
 

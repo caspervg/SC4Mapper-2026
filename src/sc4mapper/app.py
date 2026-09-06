@@ -220,6 +220,10 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                         ("Keep true elevations", "true"),
                         ("Exaggerate by", "manual")]
 
+    DATUM_CHOICES = [("Real sea level", "sea"),
+                     ("Lowest ground in the area", "lowest"),
+                     ("Elevation (m)", "manual")]
+
     def __init__(self, parent, settings):
         wx.Dialog.__init__(self, parent, -1,
                            "Create region from a real-world location",
@@ -312,8 +316,21 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         terrainSizer.Add(row, 0, wx.EXPAND)
         self.verticalNote = wx.StaticText(self, -1, " ")
         terrainSizer.Add(self.verticalNote, 0, wx.LEFT | wx.BOTTOM, 5)
+        self.datumMode = wx.Choice(
+            self, -1, choices=[label for label, _ in self.DATUM_CHOICES])
+        self.datumMode.SetSelection(0)
+        self.datum = wx.TextCtrl(self, -1, "0", size=(70, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Shoreline at"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.datumMode, 0, wx.ALL, 3)
+        row.Add(self.datum, 0, wx.ALL, 3)
+        terrainSizer.Add(row, 0, wx.EXPAND)
+        self.datumNote = wx.StaticText(self, -1, " ")
+        terrainSizer.Add(self.datumNote, 0, wx.LEFT | wx.BOTTOM, 5)
+
         self.flatten = wx.CheckBox(
-            self, -1, "Flatten everything below sea level")
+            self, -1, "Flood everything below the shoreline")
         self.flatten.SetValue(True)
         terrainSizer.Add(self.flatten, 0, wx.ALL, 3)
         self.underlay = wx.CheckBox(
@@ -350,6 +367,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             control.Bind(wx.EVT_TEXT, self.OnShapeChanged)
         self.citySize.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.verticalMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.datumMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.OnShapeChanged(None)
 
     # -- helpers ----------------------------------------------------------
@@ -387,6 +405,26 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             "Covers %.1f x %.1f km of real ground - %s"
             % (width, height, ", ".join(parts) if parts else "no cities"))
         self.UpdateVerticalNote(metres)
+        self.UpdateDatumNote()
+
+    def UpdateDatumNote(self):
+        """Explain which real elevation becomes SimCity 4's shoreline."""
+        mode = self.GetDatumMode()
+        self.datum.Enable(mode == "manual")
+        notes = {
+            "sea": "Real sea level becomes SimCity 4's shoreline. Right for "
+                   "the coast; inland, it leaves the whole area on high ground.",
+            "lowest": "The shoreline is dropped below the lowest ground here, "
+                      "so nothing floods. Use for land below sea level, such "
+                      "as polders.",
+            "manual": "The elevation entered becomes the shoreline. For a "
+                      "mountain lake, use its surface height.",
+        }
+        self.datumNote.SetLabel(notes[mode])
+
+    def GetDatumMode(self):
+        index = max(0, self.datumMode.GetSelection())
+        return self.DATUM_CHOICES[index][1]
 
     def UpdateVerticalNote(self, metres_per_cell):
         """Explain what the chosen height mode will do at this scale."""
@@ -461,6 +499,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         metres = self._float(self.metres, "Metres per cell")
         rotation = self._float(self.rotation, "Rotation", 0.0)
         vertical = self._float(self.vertical, "Vertical exaggeration", 1.0)
+        datum = self._float(self.datum, "Shoreline elevation", 0.0)
         request = geo.GeoImportRequest(
             center_lat=lat,
             center_lon=lon,
@@ -470,6 +509,8 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             rotation_deg=rotation,
             vertical_mode=self.GetVerticalMode(),
             vertical_scale=vertical,
+            water_datum_mode=self.GetDatumMode(),
+            sea_reference_m=datum,
             keep_bathymetry=not self.flatten.GetValue(),
         )
         try:

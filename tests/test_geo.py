@@ -536,6 +536,90 @@ def test_pipeline_applies_the_resolved_scale():
     assert result.georeference.vertical_scale == pytest.approx(0.5)
 
 
+# --- water datum ----------------------------------------------------------
+
+
+def test_sea_datum_is_real_sea_level():
+    req = request(water_datum_mode="sea", sea_reference_m=123.0)
+    assert req.effective_water_datum(np.array([[500.0]])) == 0.0
+
+
+def test_manual_datum_is_used_as_given():
+    req = request(water_datum_mode="manual", sea_reference_m=559.0)
+    assert req.effective_water_datum(np.array([[600.0]])) == 559.0
+
+
+def test_lowest_datum_sits_under_the_lowest_ground():
+    """So an inland region imports as dry land rather than a lake."""
+    req = request(water_datum_mode="lowest")
+    elevation = np.array([[553.0, 700.0], [600.0, 4109.0]])
+    assert req.effective_water_datum(elevation) < 553.0
+
+
+def test_lowest_datum_falls_back_before_sampling():
+    req = request(water_datum_mode="lowest", sea_reference_m=42.0)
+    assert req.effective_water_datum(None) == 42.0
+
+
+def test_unknown_datum_mode_is_rejected():
+    with pytest.raises(geo.GeoImportError):
+        request(water_datum_mode="puddle").validate()
+
+
+def test_alpine_valley_floats_above_the_shoreline_by_default():
+    """The Interlaken problem: real sea level puts the whole valley on high
+    ground, so its lakes come out as land."""
+    result = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1), ConstantFetcher(560.0))
+    assert result.water_fraction == 0.0
+    assert result.height_dm.min() > 2500  # everything above SC4's shoreline
+
+
+def test_datum_brings_an_alpine_lake_back_to_the_shoreline():
+    result = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1, water_datum_mode="manual",
+                sea_reference_m=560.0),
+        ConstantFetcher(560.0))
+    assert result.height_dm.max() == 2500  # exactly at sea level
+    assert result.georeference.sea_reference_m == 560.0
+
+
+def test_lowest_datum_keeps_land_below_sea_level_dry():
+    """The Amsterdam problem: polders sit below real sea level but are land."""
+    flooded = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1), ConstantFetcher(-5.0))
+    assert flooded.water_fraction == 1.0
+
+    dry = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1, water_datum_mode="lowest"),
+        ConstantFetcher(-5.0))
+    assert dry.water_fraction == 0.0
+    assert dry.height_dm.min() >= 2500
+
+
+def test_water_fraction_counts_submerged_vertices():
+    result = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1), ConstantFetcher(-30.0))
+    assert result.water_fraction == pytest.approx(1.0)
+
+
+def test_datum_is_recorded_on_the_georeference():
+    result = geo.build_region_grid(
+        request(tiles_x=1, tiles_y=1, water_datum_mode="lowest"),
+        ConstantFetcher(400.0))
+    assert result.georeference.sea_reference_m == pytest.approx(399.0)
+    restored = geo.GeoReference(**result.georeference.to_dict())
+    assert restored == result.georeference
+
+
+def test_summary_reports_the_shoreline_and_water():
+    result = geo.build_region_grid(request(tiles_x=1, tiles_y=1),
+                                   ConstantFetcher(-5.0))
+    text = result.summary()
+    assert "shoreline at" in text
+    assert "under water" in text
+
+
 # --- slope statistics -----------------------------------------------------
 
 
