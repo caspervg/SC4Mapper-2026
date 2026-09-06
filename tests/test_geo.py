@@ -468,6 +468,163 @@ def test_suggested_scale_leaves_normal_terrain_alone():
     assert geo.suggested_vertical_scale(1200.0) == 1.0
 
 
+# --- vertical scale -------------------------------------------------------
+
+
+@pytest.mark.parametrize("metres,expected", [
+    (16.0, 1.0), (32.0, 0.5), (48.0, 1.0 / 3.0), (8.0, 2.0), (64.0, 0.25),
+])
+def test_isotropic_scale_inverts_the_horizontal_squeeze(metres, expected):
+    assert geo.isotropic_vertical_scale(metres) == pytest.approx(expected)
+
+
+def test_isotropic_scale_rejects_nonsense():
+    with pytest.raises(geo.GeoImportError):
+        geo.isotropic_vertical_scale(0.0)
+
+
+def test_match_mode_keeps_slopes_realistic():
+    """The headline reason the mode exists.
+
+    Importing at 48 m per cell squeezes the ground threefold. Left at true
+    elevation the slopes come out three times too steep; matching the
+    horizontal scale brings them back to what the ground actually does.
+    """
+    elevation = np.zeros((129, 129), dtype=np.float32)
+    elevation[:] = np.linspace(0, 480, 129)  # a real 10% grade over 4.8 km
+
+    fine = geo.GeoImportRequest(center_lat=0.0, center_lon=0.0, tiles_x=2,
+                                tiles_y=2, metres_per_cell=48.0,
+                                vertical_mode="match")
+    true = geo.GeoImportRequest(center_lat=0.0, center_lon=0.0, tiles_x=2,
+                                tiles_y=2, metres_per_cell=48.0,
+                                vertical_mode="true")
+
+    matched, _ = geo.elevation_to_height_dm(
+        elevation, vertical_scale=fine.effective_vertical_scale())
+    untouched, _ = geo.elevation_to_height_dm(
+        elevation, vertical_scale=true.effective_vertical_scale())
+
+    steep = geo.slope_statistics(untouched)["max_grade"]
+    realistic = geo.slope_statistics(matched)["max_grade"]
+    # Not exactly threefold: heights are stored in whole decimetres, so each
+    # rounds slightly differently. The factor is what matters.
+    assert steep / realistic == pytest.approx(3.0, rel=0.05)
+
+
+@pytest.mark.parametrize("mode,metres,expected", [
+    ("match", 48.0, 1.0 / 3.0),
+    ("true", 48.0, 1.0),
+    ("manual", 48.0, 2.5),
+])
+def test_effective_vertical_scale(mode, metres, expected):
+    req = request(metres_per_cell=metres, vertical_mode=mode, vertical_scale=2.5)
+    assert req.effective_vertical_scale() == pytest.approx(expected)
+
+
+def test_unknown_vertical_mode_is_rejected():
+    with pytest.raises(geo.GeoImportError):
+        request(vertical_mode="sideways").validate()
+
+
+def test_pipeline_applies_the_resolved_scale():
+    req = request(tiles_x=1, tiles_y=1, metres_per_cell=32.0,
+                  vertical_mode="match")
+    result = geo.build_region_grid(req, ConstantFetcher(100.0))
+    # 250 m sea level + 100 m halved = 300 m
+    assert result.height_dm[0, 0] == 3000
+    assert result.georeference.vertical_scale == pytest.approx(0.5)
+
+
+# --- slope statistics -----------------------------------------------------
+
+
+def test_flat_ground_has_no_slope():
+    flat = np.full((10, 10), 2500, dtype=np.uint16)
+    stats = geo.slope_statistics(flat)
+    assert stats["max_grade"] == 0.0
+    assert stats["steep_fraction"] == 0.0
+
+
+def test_slope_is_measured_over_the_16m_cell():
+    """A 1.6 m rise across one cell is a 10% grade, whatever the import scale."""
+    ramp = np.arange(0, 10, dtype=np.float64) * 16.0 + 2500  # 1.6 m per cell
+    grid = np.tile(ramp, (4, 1)).astype(np.uint16)
+    stats = geo.slope_statistics(grid)
+    assert stats["max_grade"] == pytest.approx(0.10)
+    assert stats["p95_grade"] == pytest.approx(0.10)
+    assert stats["steep_fraction"] == 0.0  # 10% is under the 15% warning line
+
+
+def test_steep_fraction_counts_edges_over_the_threshold():
+    grid = np.full((4, 4), 2500, dtype=np.uint16)
+    grid[:, 2:] = 2500 + 400  # a 40 m step = 250% grade
+    stats = geo.slope_statistics(grid)
+    assert stats["max_grade"] > geo.STEEP_GRADE
+    assert 0.0 < stats["steep_fraction"] < 1.0
+
+
+def test_slope_statistics_survive_a_single_row():
+    stats = geo.slope_statistics(np.full((1, 1), 2500, dtype=np.uint16))
+    assert stats["max_grade"] == 0.0
+
+
+# --- despiking ------------------------------------------------------------
+
+
+def test_despike_removes_an_isolated_artifact():
+    """Global DEM mosaics carry junk pixels; one must not spike the terrain."""
+    elevation = np.full((32, 32), 50.0, dtype=np.float32)
+    elevation[16, 16] = 6431.0  # the kind of value the real HK tile holds
+    cleaned, count = geo.despike_elevation(elevation)
+    assert count == 1
+    assert cleaned[16, 16] == pytest.approx(50.0)
+    assert cleaned.max() == pytest.approx(50.0)
+
+
+def test_despike_leaves_real_terrain_alone():
+    """A steep but genuine slope must survive untouched."""
+    ramp = np.tile(np.linspace(0, 1500, 64), (64, 1)).astype(np.float32)
+    cleaned, count = geo.despike_elevation(ramp)
+    assert count == 0
+    assert np.allclose(cleaned, ramp)
+
+
+def test_despike_preserves_a_cliff():
+    elevation = np.full((32, 32), 10.0, dtype=np.float32)
+    elevation[:, 16:] = 150.0  # a 140 m cliff, under the threshold
+    cleaned, count = geo.despike_elevation(elevation)
+    assert count == 0
+    assert cleaned[0, 20] == pytest.approx(150.0)
+
+
+def test_despike_can_be_switched_off():
+    elevation = np.full((8, 8), 10.0, dtype=np.float32)
+    elevation[4, 4] = 9000.0
+    cleaned, count = geo.despike_elevation(elevation, threshold_m=0)
+    assert count == 0
+    assert cleaned[4, 4] == pytest.approx(9000.0)
+
+
+def test_despike_ignores_tiny_grids():
+    tiny = np.array([[1.0, 2.0], [3.0, 9000.0]], dtype=np.float32)
+    cleaned, count = geo.despike_elevation(tiny)
+    assert count == 0
+
+
+def test_pipeline_reports_despiked_vertices():
+    class SpikyFetcher(ConstantFetcher):
+        def __init__(self):
+            super().__init__(0.0)
+            grid = np.full((geo.TILE_PIXELS, geo.TILE_PIXELS), 20.0)
+            grid[128, 128] = 6000.0
+            self._data = encode_terrarium(grid)
+
+    result = geo.build_region_grid(request(), SpikyFetcher())
+    assert result.despiked_vertices >= 0
+    assert result.max_elevation_m < 1000.0
+
+
 # --- the whole pipeline ---------------------------------------------------
 
 

@@ -216,6 +216,10 @@ class CreateRgnFromLocationDialog(wx.Dialog):
     CITY_CHOICES = [("Large cities (4x4)", 4), ("Medium cities (2x2)", 2),
                     ("Small cities (1x1)", 1)]
 
+    VERTICAL_CHOICES = [("Match the horizontal scale", "match"),
+                        ("Keep true elevations", "true"),
+                        ("Exaggerate by", "manual")]
+
     def __init__(self, parent, settings):
         wx.Dialog.__init__(self, parent, -1,
                            "Create region from a real-world location",
@@ -296,12 +300,18 @@ class CreateRgnFromLocationDialog(wx.Dialog):
 
         terrainBox = wx.StaticBox(self, -1, "Terrain")
         terrainSizer = wx.StaticBoxSizer(terrainBox, wx.VERTICAL)
+        self.verticalMode = wx.Choice(
+            self, -1, choices=[label for label, _ in self.VERTICAL_CHOICES])
+        self.verticalMode.SetSelection(0)
         self.vertical = wx.TextCtrl(self, -1, "1.0", size=(60, -1))
         row = wx.BoxSizer(wx.HORIZONTAL)
-        row.Add(wx.StaticText(self, -1, "Vertical exaggeration"), 0,
+        row.Add(wx.StaticText(self, -1, "Heights"), 0,
                 wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.verticalMode, 0, wx.ALL, 3)
         row.Add(self.vertical, 0, wx.ALL, 3)
         terrainSizer.Add(row, 0, wx.EXPAND)
+        self.verticalNote = wx.StaticText(self, -1, " ")
+        terrainSizer.Add(self.verticalNote, 0, wx.LEFT | wx.BOTTOM, 5)
         self.flatten = wx.CheckBox(
             self, -1, "Flatten everything below sea level")
         self.flatten.SetValue(True)
@@ -339,6 +349,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         for control in (self.sizeX, self.sizeY, self.metres):
             control.Bind(wx.EVT_TEXT, self.OnShapeChanged)
         self.citySize.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.verticalMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.OnShapeChanged(None)
 
     # -- helpers ----------------------------------------------------------
@@ -375,6 +386,30 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.footprint.SetLabel(
             "Covers %.1f x %.1f km of real ground - %s"
             % (width, height, ", ".join(parts) if parts else "no cities"))
+        self.UpdateVerticalNote(metres)
+
+    def UpdateVerticalNote(self, metres_per_cell):
+        """Explain what the chosen height mode will do at this scale."""
+        mode = self.GetVerticalMode()
+        self.vertical.Enable(mode == "manual")
+        if mode == "manual":
+            self.verticalNote.SetLabel(
+                "Heights are multiplied by the factor above.")
+            return
+        if mode == "true":
+            note = ("Real metres, kept as they are. A cell is always 16 m "
+                    "in game, so at %.0f m per cell slopes come out %.1fx "
+                    "steeper than life."
+                    % (metres_per_cell, metres_per_cell / geo.CELL_SIZE_M))
+        else:
+            scale = geo.isotropic_vertical_scale(metres_per_cell)
+            note = ("Heights scaled %.2fx so hills keep their real profile."
+                    % scale)
+        self.verticalNote.SetLabel(note)
+
+    def GetVerticalMode(self):
+        index = max(0, self.verticalMode.GetSelection())
+        return self.VERTICAL_CHOICES[index][1]
 
     def GetCitySize(self):
         index = max(0, self.citySize.GetSelection())
@@ -433,6 +468,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             tiles_y=int(self.sizeY.GetValue()),
             metres_per_cell=metres,
             rotation_deg=rotation,
+            vertical_mode=self.GetVerticalMode(),
             vertical_scale=vertical,
             keep_bathymetry=not self.flatten.GetValue(),
         )

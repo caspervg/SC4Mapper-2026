@@ -372,13 +372,25 @@ class GeoImportRequest:
     tiles_y: int
     metres_per_cell: float = CELL_SIZE_M
     rotation_deg: float = 0.0
+    #: "match" keeps real-world proportions, "true" keeps real metres, and
+    #: "manual" uses vertical_scale as given.
+    vertical_mode: str = "match"
     vertical_scale: float = 1.0
     sea_level_m: float = SEA_LEVEL_M
     sea_reference_m: float = 0.0
     ocean_depth_m: float = 20.0
     keep_bathymetry: bool = False
+    despike_threshold_m: float = 200.0
     max_zoom: int = 14
     zoom: Optional[int] = None
+
+    def effective_vertical_scale(self):
+        """The vertical scale actually applied, after resolving the mode."""
+        if self.vertical_mode == "match":
+            return isotropic_vertical_scale(self.metres_per_cell)
+        if self.vertical_mode == "true":
+            return 1.0
+        return self.vertical_scale
 
     def validate(self):
         if not -90.0 <= self.center_lat <= 90.0:
@@ -395,6 +407,9 @@ class GeoImportRequest:
             raise GeoImportError("Metres per cell must be positive")
         if self.vertical_scale <= 0:
             raise GeoImportError("Vertical scale must be positive")
+        if self.vertical_mode not in ("match", "true", "manual"):
+            raise GeoImportError(
+                "Vertical mode must be 'match', 'true' or 'manual'")
 
     @property
     def grid_shape(self):
@@ -414,6 +429,8 @@ class GeoImportResult:
     tiles_fetched: int = 0
     tiles_missing: int = 0
     clamped_vertices: int = 0
+    despiked_vertices: int = 0
+    slopes: dict = None
     attribution: str = DEFAULT_ATTRIBUTION
 
     @property
@@ -432,8 +449,20 @@ class GeoImportResult:
             % (geo.width_m / 1000.0, geo.height_m / 1000.0, geo.metres_per_cell),
             "Elevation: %.0f m to %.0f m (real world)"
             % (self.min_elevation_m, self.max_elevation_m),
+            "Vertical scale: %.2fx" % geo.vertical_scale,
             "Source zoom %d, %d tiles" % (self.zoom, self.tiles_fetched),
         ]
+        if self.slopes:
+            lines.append(
+                "Slopes in game: %.0f%% median, %.0f%% at the 95th percentile, "
+                "%.0f%% of edges steeper than %.0f%%"
+                % (self.slopes["median_grade"] * 100,
+                   self.slopes["p95_grade"] * 100,
+                   self.slopes["steep_fraction"] * 100,
+                   STEEP_GRADE * 100))
+        if self.despiked_vertices:
+            lines.append("%d source artifact(s) smoothed away"
+                         % self.despiked_vertices)
         if self.tiles_missing:
             lines.append("%d tile(s) had no data and were treated as sea"
                          % self.tiles_missing)
@@ -585,6 +614,42 @@ def sample_basemap(request, fetcher, progress=None):
     return rgb, zoom, fetched, missing
 
 
+def despike_elevation(elevation_m, threshold_m=200.0):
+    """Replace isolated bad samples with the local median.
+
+    Global DEM mosaics carry occasional junk pixels -- the tile covering the
+    sea south-east of Hong Kong, for instance, holds a handful of 5000-6000 m
+    readings. They are rare enough to ignore for most purposes, but a single
+    one puts a needle through the terrain and, worse, drags any automatic
+    vertical scaling along with it.
+
+    Real ground almost never jumps by hundreds of metres between neighbouring
+    samples, so anything that far from its 3x3 median is treated as an
+    artifact. Cliffs and ridge lines sit well inside the threshold and are
+    left alone.
+
+    Returns ``(cleaned, count_replaced)``.
+    """
+    elevation = np.asarray(elevation_m, dtype=np.float32)
+    if threshold_m <= 0 or elevation.ndim != 2:
+        return elevation, 0
+    if elevation.shape[0] < 3 or elevation.shape[1] < 3:
+        return elevation, 0
+
+    padded = np.pad(elevation, 1, mode="edge")
+    neighbourhood = np.stack(
+        [padded[dy:dy + elevation.shape[0], dx:dx + elevation.shape[1]]
+         for dy in range(3) for dx in range(3)],
+        axis=0)
+    median = np.median(neighbourhood, axis=0)
+
+    spikes = np.abs(elevation - median) > threshold_m
+    count = int(np.count_nonzero(spikes))
+    if count:
+        elevation = np.where(spikes, median, elevation).astype(np.float32)
+    return elevation, count
+
+
 def elevation_to_height_dm(elevation_m, sea_level_m=SEA_LEVEL_M,
                            vertical_scale=1.0, sea_reference_m=0.0,
                            ocean_depth_m=20.0, keep_bathymetry=False):
@@ -620,13 +685,61 @@ def suggested_vertical_scale(max_elevation_m, sea_reference_m=0.0,
     return min(1.0, headroom_m / relief)
 
 
+def isotropic_vertical_scale(metres_per_cell):
+    """Vertical scale that keeps the terrain in proportion with the ground.
+
+    A SimCity 4 cell is always 16 m wide in game units, whatever slice of
+    the real world it stands for.  Importing at 48 m per cell squeezes the
+    ground to a third of its size horizontally while leaving elevations
+    untouched, which makes every slope three times as steep as it really
+    is.  Scaling heights by ``16 / metres_per_cell`` cancels that out, so
+    hills keep the profile they have in life.
+    """
+    if metres_per_cell <= 0:
+        raise GeoImportError("Metres per cell must be positive")
+    return CELL_SIZE_M / float(metres_per_cell)
+
+
+#: Grade above which SimCity 4 networks start to struggle. Approximate --
+#: the game's real limits vary by network type -- but a useful warning line.
+STEEP_GRADE = 0.15
+
+
+def slope_statistics(height_dm, steep_grade=STEEP_GRADE):
+    """Describe the steepness of a finished region height grid.
+
+    Grades are measured the way the game sees them: rise in SC4 metres over
+    the fixed 16 m cell.  That makes the numbers directly comparable to what
+    roads and rail can climb, whatever real-world scale was imported.
+    """
+    heights = np.asarray(height_dm, dtype=np.float64) / 10.0
+    runs = []
+    if heights.shape[1] > 1:
+        runs.append(np.abs(np.diff(heights, axis=1)).ravel())
+    if heights.shape[0] > 1:
+        runs.append(np.abs(np.diff(heights, axis=0)).ravel())
+    if not runs:
+        return {"max_grade": 0.0, "median_grade": 0.0, "p95_grade": 0.0,
+                "steep_fraction": 0.0}
+    rise = np.concatenate(runs)
+    grade = rise / CELL_SIZE_M
+    return {
+        "max_grade": float(grade.max()),
+        "median_grade": float(np.median(grade)),
+        "p95_grade": float(np.percentile(grade, 95)),
+        "steep_fraction": float(np.count_nonzero(grade > steep_grade) / grade.size),
+    }
+
+
 def build_region_grid(request, fetcher, progress=None):
     """Fetch, project and convert -- the whole import in one call."""
     elevation, zoom, fetched, missing = sample_elevation(request, fetcher, progress)
+    elevation, despiked = despike_elevation(elevation, request.despike_threshold_m)
+    vertical_scale = request.effective_vertical_scale()
     height_dm, clamped = elevation_to_height_dm(
         elevation,
         sea_level_m=request.sea_level_m,
-        vertical_scale=request.vertical_scale,
+        vertical_scale=vertical_scale,
         sea_reference_m=request.sea_reference_m,
         ocean_depth_m=request.ocean_depth_m,
         keep_bathymetry=request.keep_bathymetry,
@@ -639,7 +752,7 @@ def build_region_grid(request, fetcher, progress=None):
         metres_per_cell=request.metres_per_cell,
         rotation_deg=request.rotation_deg,
         sea_level_m=request.sea_level_m,
-        vertical_scale=request.vertical_scale,
+        vertical_scale=vertical_scale,
         sea_reference_m=request.sea_reference_m,
         zoom=zoom,
     )
@@ -651,6 +764,8 @@ def build_region_grid(request, fetcher, progress=None):
         tiles_fetched=fetched,
         tiles_missing=missing,
         clamped_vertices=clamped,
+        despiked_vertices=despiked,
+        slopes=slope_statistics(height_dm),
     )
 
 

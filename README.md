@@ -35,9 +35,8 @@ a place and the shape of the region to cut out of it:
   dialog shows the resulting footprint in kilometres as you type.
 - **Start layout with** picks the city size to pack the region with. Whatever
   does not fit is filled with smaller cities.
-- **Vertical exaggeration** scales relief. Real slopes at true scale are
-  often too steep to build on, so mountainous areas usually want a value
-  below 1.
+- **Heights** decides how elevations map onto SimCity 4's vertical axis
+  (see below).
 - Sea level is SimCity 4's 250 m datum. By default everything below the
   real shoreline is flattened to a shallow shelf, because scaled ocean
   bathymetry would otherwise bottom out as a pit.
@@ -46,6 +45,42 @@ Elevation comes from the [Mapzen/AWS terrain
 tiles](https://registry.opendata.aws/terrain-tiles/): global coverage, open
 data, no API key. Tiles are cached on disk, so re-importing an area is
 offline and instant.
+
+### Heights and the Vertical Axis
+
+A SimCity 4 cell is always 16 m wide in game units, whatever slice of the
+real world it stands for. Import at 48 m per cell and the ground is
+squeezed to a third of its size horizontally while elevations are
+untouched, so every slope comes out three times steeper than life. The
+**Heights** setting handles that:
+
+- **Match the horizontal scale** (default) multiplies heights by
+  `16 / metres_per_cell`, so hills keep the profile they have in reality
+  at any import scale.
+- **Keep true elevations** leaves real metres alone. Correct at 16 m per
+  cell; increasingly dramatic as you zoom out.
+- **Exaggerate by** takes a factor of your own.
+
+The import reports the slopes it produced, measured as the game sees them
+-- rise over the fixed 16 m cell. Roughly, grades past about 15% start to
+give SimCity 4's networks trouble, so a region reporting a large fraction
+above that will need terraforming before much can be built. Some places
+are simply like that: an 8 km square of the Grand Canyon at true scale
+comes out with 71% of its edges over 15%, which is the canyon being a
+canyon rather than anything the importer did wrong.
+
+Two other things the importer does automatically:
+
+- **Sea level** is SimCity 4's 250 m datum. Everything below the real
+  shoreline is flattened to a shallow shelf by default, because scaled
+  ocean bathymetry (which reaches several kilometres down) would otherwise
+  bottom out as a vast pit. Untick to keep the real sea floor.
+- **Artifacts are removed.** Global DEM mosaics carry occasional junk
+  pixels; the tile covering the sea off Hong Kong, for instance, holds a
+  handful of 5000-6000 m readings. Samples that sit more than 200 m from
+  their local median are replaced, which takes out the needles while
+  leaving cliffs and ridge lines alone. The import reports how many it
+  found.
 
 ### Laying Out City Tiles
 
