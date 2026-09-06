@@ -1,0 +1,857 @@
+"""Create regions from real-world locations using tiled elevation data.
+
+This module turns a point on the globe plus a scale into the ``uint16``
+decimetre height grid the rest of SC4Mapper works with, so a region can be
+built from a location instead of from a bitmap.
+
+Nothing here imports wx, and every network access goes through an injected
+fetcher, so the whole pipeline stays testable headless and offline.
+
+Coordinate conventions
+----------------------
+* Elevation sources are slippy-map tiles in Web Mercator (EPSG:3857).
+* The region grid is laid out on a *local* metric frame centred on the
+  region -- east/north metres, converted back to lon/lat row by row.  Over a
+  region-sized area (tens of km) this is accurate to well under a metre,
+  which is far inside the noise of any global DEM, and it avoids the
+  north-south stretching you get by sampling Web Mercator directly.
+* Grid row 0 is the **north** edge and column 0 the **west** edge, matching
+  config.bmp and the in-game region view.
+
+Height convention
+-----------------
+Region height arrays are ``uint16`` decimetres, with SC4's sea level at
+250 m (2500 dm).  That is the same representation the bitmap import paths
+produce, so a geographic import drops straight into ``SC4Region.height``.
+"""
+
+import math
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional, Protocol
+
+import numpy as np
+from PIL import Image
+
+# --- SC4 geometry ---------------------------------------------------------
+
+#: Width of one terrain cell in metres.
+CELL_SIZE_M = 16.0
+#: Cells along one edge of a small city tile (one config.bmp pixel).
+CELLS_PER_TILE = 64
+#: SC4's sea level, in metres.
+SEA_LEVEL_M = 250.0
+#: Largest height the uint16 decimetre representation can hold, in metres.
+MAX_HEIGHT_M = 65535 / 10.0
+
+# --- Elevation source -----------------------------------------------------
+
+#: Mapzen/AWS "terrarium" terrain tiles: global, open, and no API key.
+DEFAULT_TILE_URL = (
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+)
+#: Attribution that must be shown for the default source.
+DEFAULT_ATTRIBUTION = (
+    "Elevation: Mapzen Terrain Tiles / AWS Open Data. Sources include SRTM, "
+    "USGS 3DEP/NED, Copernicus/EU-DEM, GMTED2010, ETOPO1 and national "
+    "datasets. See https://registry.opendata.aws/terrain-tiles/"
+)
+#: Raster map sources for the underlay, offered as a starting point.
+#:
+#: There is deliberately no default. Unlike the elevation source, general
+#: map and imagery tile servers each carry their own terms -- OpenStreetMap's
+#: policy, for one, explicitly forbids a distributed application drawing on
+#: their tiles -- so choosing a provider (and supplying any API key) has to
+#: be the user's decision, not a hardcoded one. Set ``basemap_url`` in
+#: SC4Mapper.ini to switch the underlay on.
+BASEMAP_PRESETS = {}
+
+#: Terrarium tiles are 256x256.
+TILE_PIXELS = 256
+#: Highest zoom the default source publishes.
+SOURCE_MAX_ZOOM = 15
+#: Ground resolution of one pixel at zoom 0 on the equator, in metres.
+EQUATOR_RESOLUTION_M = 2 * math.pi * 6378137.0 / TILE_PIXELS
+#: Latitude beyond which Web Mercator is undefined.
+MERCATOR_MAX_LAT = 85.0511287798066
+
+#: Refuse to assemble a mosaic larger than this many tiles.
+MAX_MOSAIC_TILES = 512
+
+
+class GeoImportError(Exception):
+    """Raised when a location cannot be turned into a region."""
+
+
+# --- Web Mercator / slippy map --------------------------------------------
+
+
+def lonlat_to_tile(lon, lat, zoom):
+    """Return fractional slippy-map tile coordinates for a lon/lat.
+
+    Accepts scalars or numpy arrays.
+    """
+    lat = np.clip(lat, -MERCATOR_MAX_LAT, MERCATOR_MAX_LAT)
+    n = 2.0 ** zoom
+    x = (np.asarray(lon, dtype=np.float64) + 180.0) / 360.0 * n
+    lat_rad = np.radians(lat)
+    y = (1.0 - np.arcsinh(np.tan(lat_rad)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def tile_to_lonlat(x, y, zoom):
+    """Inverse of :func:`lonlat_to_tile`."""
+    n = 2.0 ** zoom
+    lon = np.asarray(x, dtype=np.float64) / n * 360.0 - 180.0
+    lat = np.degrees(np.arctan(np.sinh(math.pi * (1.0 - 2.0 * np.asarray(y, dtype=np.float64) / n))))
+    return lon, lat
+
+
+def tile_resolution_m(zoom, lat):
+    """Ground resolution of one tile pixel, in metres per pixel."""
+    return EQUATOR_RESOLUTION_M * math.cos(math.radians(lat)) / (2.0 ** zoom)
+
+
+def zoom_for_resolution(target_m, lat, max_zoom=SOURCE_MAX_ZOOM):
+    """Smallest zoom whose pixels are at least as fine as ``target_m``.
+
+    Matching source resolution to the sample spacing keeps the download
+    bounded no matter how far the user zooms out: a coarser region simply
+    pulls a coarser zoom, so tile counts stay roughly constant.
+    """
+    if target_m <= 0:
+        raise GeoImportError("Sample spacing must be positive")
+    cos_lat = max(math.cos(math.radians(min(abs(lat), MERCATOR_MAX_LAT))), 1e-6)
+    ideal = math.log2(EQUATOR_RESOLUTION_M * cos_lat / target_m)
+    return int(max(0, min(max_zoom, math.ceil(ideal))))
+
+
+# --- Local metric frame ---------------------------------------------------
+
+
+def metres_per_degree_lat(lat):
+    """Length of one degree of latitude, in metres, on the WGS84 ellipsoid."""
+    phi = math.radians(lat)
+    return (111132.92
+            - 559.82 * math.cos(2 * phi)
+            + 1.175 * math.cos(4 * phi)
+            - 0.0023 * math.cos(6 * phi))
+
+
+def metres_per_degree_lon(lat):
+    """Length of one degree of longitude, in metres, on the WGS84 ellipsoid.
+
+    Accepts scalars or numpy arrays, so it can be evaluated per grid row.
+    """
+    phi = np.radians(lat)
+    return (111412.84 * np.cos(phi)
+            - 93.5 * np.cos(3 * phi)
+            + 0.118 * np.cos(5 * phi))
+
+
+def local_offsets_to_lonlat(center_lat, center_lon, east_m, north_m):
+    """Convert local east/north metre offsets to lon/lat.
+
+    Latitude is derived first, then longitude is scaled at *that* latitude
+    rather than at the region centre.  Over a tall region the difference is
+    real: at 60 degrees north, cos(phi) changes by ~1.6% across 64 km, which
+    would otherwise show up as an east-west scale error.
+    """
+    lat = center_lat + np.asarray(north_m, dtype=np.float64) / metres_per_degree_lat(center_lat)
+    m_per_deg_lon = metres_per_degree_lon(lat)
+    m_per_deg_lon = np.where(np.abs(m_per_deg_lon) < 1e-6, 1e-6, m_per_deg_lon)
+    lon = center_lon + np.asarray(east_m, dtype=np.float64) / m_per_deg_lon
+    return lon, lat
+
+
+# --- Terrarium decoding ---------------------------------------------------
+
+
+def decode_terrarium(rgb):
+    """Decode terrarium-encoded RGB pixels to elevation in metres.
+
+    ``height = (R * 256 + G + B / 256) - 32768``
+    """
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise GeoImportError("Elevation tile is not an RGB image")
+    return (arr[:, :, 0] * 256.0
+            + arr[:, :, 1]
+            + arr[:, :, 2] / 256.0) - 32768.0
+
+
+# --- Tile fetching --------------------------------------------------------
+
+
+class TileFetcher(Protocol):
+    """Something that can return the bytes of an elevation tile."""
+
+    def fetch(self, zoom: int, x: int, y: int) -> Optional[bytes]:
+        """Return PNG bytes, or ``None`` when the tile does not exist."""
+
+
+class HttpTileFetcher:
+    """Fetch elevation tiles over HTTP, with an on-disk cache.
+
+    Tiles are immutable, so the cache never needs invalidating; re-importing
+    the same area is offline and instant.
+    """
+
+    def __init__(self, url_template=DEFAULT_TILE_URL, cache_dir=None,
+                 user_agent=None, timeout=30):
+        self.url_template = url_template
+        self.cache_dir = cache_dir
+        self.timeout = timeout
+        self.user_agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
+
+    def _cache_path(self, zoom, x, y):
+        if not self.cache_dir:
+            return None
+        return os.path.join(self.cache_dir, str(zoom), str(x), "%d.png" % y)
+
+    def fetch(self, zoom, x, y):
+        path = self._cache_path(zoom, x, y)
+        if path and os.path.exists(path):
+            with open(path, "rb") as fh:
+                return fh.read()
+
+        url = self.url_template.format(z=zoom, x=x, y=y)
+        request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 404):
+                return None
+            raise GeoImportError("Elevation server returned HTTP %d for %s"
+                                 % (exc.code, url)) from exc
+        except urllib.error.URLError as exc:
+            raise GeoImportError("Could not reach the elevation server (%s). "
+                                 "Check your network connection." % exc.reason) from exc
+
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".part"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        return data
+
+
+class DictTileFetcher:
+    """In-memory fetcher backed by a ``{(z, x, y): bytes}`` mapping.
+
+    Used by the tests, and handy for feeding a pre-downloaded tile set.
+    """
+
+    def __init__(self, tiles=None):
+        self.tiles = dict(tiles or {})
+        self.requests = []
+
+    def fetch(self, zoom, x, y):
+        self.requests.append((zoom, x, y))
+        return self.tiles.get((zoom, x, y))
+
+
+def _decode_tile(data):
+    """Decode PNG bytes into a 2D float32 elevation array."""
+    import io
+
+    with Image.open(io.BytesIO(data)) as img:
+        img = img.convert("RGB")
+        return decode_terrarium(np.asarray(img))
+
+
+def _decode_rgb_tile(data):
+    """Decode image bytes into a float32 RGB array."""
+    import io
+
+    with Image.open(io.BytesIO(data)) as img:
+        return np.asarray(img.convert("RGB"), dtype=np.float32)
+
+
+# --- Sampling -------------------------------------------------------------
+
+
+def _bilinear(source, px, py):
+    """Bilinearly sample ``source`` at continuous pixel coordinates.
+
+    Handles both 2D (elevation) and 3D (RGB) sources.
+
+    Pixel *centres* sit at ``i + 0.5``, so the half-pixel shift is applied
+    here; skipping it biases every sample by half a source pixel, which at a
+    coarse zoom is tens of metres on the ground.
+    """
+    height, width = source.shape[:2]
+    fx = np.asarray(px, dtype=np.float64) - 0.5
+    fy = np.asarray(py, dtype=np.float64) - 0.5
+
+    x0 = np.floor(fx).astype(np.int64)
+    y0 = np.floor(fy).astype(np.int64)
+    tx = fx - x0
+    ty = fy - y0
+    if source.ndim == 3:
+        tx = tx[..., None]
+        ty = ty[..., None]
+
+    x0c = np.clip(x0, 0, width - 1)
+    x1c = np.clip(x0 + 1, 0, width - 1)
+    y0c = np.clip(y0, 0, height - 1)
+    y1c = np.clip(y0 + 1, 0, height - 1)
+
+    v00 = source[y0c, x0c]
+    v10 = source[y0c, x1c]
+    v01 = source[y1c, x0c]
+    v11 = source[y1c, x1c]
+
+    top = v00 + (v10 - v00) * tx
+    bottom = v01 + (v11 - v01) * tx
+    return top + (bottom - top) * ty
+
+
+# --- Requests and results -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GeoReference:
+    """Everything needed to map a region cell back to the real world.
+
+    Kept as its own object so it can later be written into the city saves as
+    a sidecar DBPF record, letting in-game plugins line real-world data up
+    with the imported terrain.
+    """
+
+    center_lat: float
+    center_lon: float
+    tiles_x: int
+    tiles_y: int
+    metres_per_cell: float
+    rotation_deg: float
+    sea_level_m: float
+    vertical_scale: float
+    sea_reference_m: float
+    source: str = DEFAULT_TILE_URL
+    zoom: int = 0
+
+    @property
+    def width_m(self):
+        return self.tiles_x * CELLS_PER_TILE * self.metres_per_cell
+
+    @property
+    def height_m(self):
+        return self.tiles_y * CELLS_PER_TILE * self.metres_per_cell
+
+    def to_dict(self):
+        """A plain dict, ready for JSON or a binary record."""
+        return {
+            "center_lat": self.center_lat,
+            "center_lon": self.center_lon,
+            "tiles_x": self.tiles_x,
+            "tiles_y": self.tiles_y,
+            "metres_per_cell": self.metres_per_cell,
+            "rotation_deg": self.rotation_deg,
+            "sea_level_m": self.sea_level_m,
+            "vertical_scale": self.vertical_scale,
+            "sea_reference_m": self.sea_reference_m,
+            "source": self.source,
+            "zoom": self.zoom,
+        }
+
+
+@dataclass
+class GeoImportRequest:
+    """A location, a footprint and a vertical mapping."""
+
+    center_lat: float
+    center_lon: float
+    tiles_x: int
+    tiles_y: int
+    metres_per_cell: float = CELL_SIZE_M
+    rotation_deg: float = 0.0
+    vertical_scale: float = 1.0
+    sea_level_m: float = SEA_LEVEL_M
+    sea_reference_m: float = 0.0
+    ocean_depth_m: float = 20.0
+    keep_bathymetry: bool = False
+    max_zoom: int = 14
+    zoom: Optional[int] = None
+
+    def validate(self):
+        if not -90.0 <= self.center_lat <= 90.0:
+            raise GeoImportError("Latitude must be between -90 and 90")
+        if not -180.0 <= self.center_lon <= 180.0:
+            raise GeoImportError("Longitude must be between -180 and 180")
+        if abs(self.center_lat) > MERCATOR_MAX_LAT:
+            raise GeoImportError(
+                "Latitude %.4f is outside the coverage of Web Mercator tiles "
+                "(+/-85.05 degrees)" % self.center_lat)
+        if self.tiles_x < 1 or self.tiles_y < 1:
+            raise GeoImportError("A region needs at least one tile on each side")
+        if self.metres_per_cell <= 0:
+            raise GeoImportError("Metres per cell must be positive")
+        if self.vertical_scale <= 0:
+            raise GeoImportError("Vertical scale must be positive")
+
+    @property
+    def grid_shape(self):
+        """(rows, columns) of terrain vertices -- cells plus a shared edge."""
+        return (self.tiles_y * CELLS_PER_TILE + 1,
+                self.tiles_x * CELLS_PER_TILE + 1)
+
+
+@dataclass
+class GeoImportResult:
+    """The height grid plus enough detail to explain what happened."""
+
+    height_dm: np.ndarray
+    elevation_m: np.ndarray
+    georeference: GeoReference
+    zoom: int
+    tiles_fetched: int = 0
+    tiles_missing: int = 0
+    clamped_vertices: int = 0
+    attribution: str = DEFAULT_ATTRIBUTION
+
+    @property
+    def min_elevation_m(self):
+        return float(np.min(self.elevation_m))
+
+    @property
+    def max_elevation_m(self):
+        return float(np.max(self.elevation_m))
+
+    def summary(self):
+        geo = self.georeference
+        lines = [
+            "Centre: %.5f, %.5f" % (geo.center_lat, geo.center_lon),
+            "Footprint: %.1f x %.1f km at %.1f m/cell"
+            % (geo.width_m / 1000.0, geo.height_m / 1000.0, geo.metres_per_cell),
+            "Elevation: %.0f m to %.0f m (real world)"
+            % (self.min_elevation_m, self.max_elevation_m),
+            "Source zoom %d, %d tiles" % (self.zoom, self.tiles_fetched),
+        ]
+        if self.tiles_missing:
+            lines.append("%d tile(s) had no data and were treated as sea"
+                         % self.tiles_missing)
+        if self.clamped_vertices:
+            lines.append("%d vertex height(s) clamped to the representable range"
+                         % self.clamped_vertices)
+        return "\n".join(lines)
+
+
+# --- The pipeline ---------------------------------------------------------
+
+
+def grid_lonlat(request):
+    """Longitude/latitude of every terrain vertex in the region.
+
+    Returns two ``(rows, cols)`` arrays.  Row 0 is the north edge.
+    """
+    rows, cols = request.grid_shape
+    spacing = request.metres_per_cell
+
+    # Vertex offsets from the region centre, in metres.
+    east = (np.arange(cols, dtype=np.float64) - (cols - 1) / 2.0) * spacing
+    north = ((rows - 1) / 2.0 - np.arange(rows, dtype=np.float64)) * spacing
+    east_grid, north_grid = np.meshgrid(east, north)
+
+    if request.rotation_deg:
+        theta = math.radians(request.rotation_deg)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        east_rot = east_grid * cos_t + north_grid * sin_t
+        north_rot = -east_grid * sin_t + north_grid * cos_t
+        east_grid, north_grid = east_rot, north_rot
+
+    return local_offsets_to_lonlat(request.center_lat, request.center_lon,
+                                   east_grid, north_grid)
+
+
+def _sample_tiles(request, fetcher, decode, channels, label, progress=None,
+                  fill=0.0):
+    """Sample a slippy-map tile source over the region's vertex grid.
+
+    ``decode`` turns PNG/JPEG bytes into an array; ``channels`` is ``None``
+    for a 2D source (elevation) or 3 for RGB imagery.  Elevation and the
+    basemap underlay go through here so they land on exactly the same grid
+    -- a pixel of the underlay is the same patch of ground as the terrain
+    vertex beneath it.
+
+    Returns ``(sampled, zoom, tiles_fetched, tiles_missing)``.
+    """
+    request.validate()
+    lon, lat = grid_lonlat(request)
+
+    zoom = request.zoom
+    if zoom is None:
+        zoom = zoom_for_resolution(request.metres_per_cell, request.center_lat,
+                                   max_zoom=request.max_zoom)
+
+    tx, ty = lonlat_to_tile(lon, lat, zoom)
+    tile_x0 = int(math.floor(float(np.min(tx))))
+    tile_x1 = int(math.floor(float(np.max(tx))))
+    tile_y0 = int(math.floor(float(np.min(ty))))
+    tile_y1 = int(math.floor(float(np.max(ty))))
+
+    n_x = tile_x1 - tile_x0 + 1
+    n_y = tile_y1 - tile_y0 + 1
+    total = n_x * n_y
+    if total > MAX_MOSAIC_TILES:
+        raise GeoImportError(
+            "This area needs %d %s tiles (limit %d). Increase metres per "
+            "cell, shrink the region, or lower the maximum zoom."
+            % (total, label, MAX_MOSAIC_TILES))
+
+    shape = (n_y * TILE_PIXELS, n_x * TILE_PIXELS)
+    if channels:
+        shape = shape + (channels,)
+    mosaic = np.full(shape, fill, dtype=np.float32)
+    fetched = 0
+    missing = 0
+    span = 2 ** zoom
+
+    for iy in range(n_y):
+        for ix in range(n_x):
+            done = iy * n_x + ix
+            if progress is not None:
+                progress(done, total, "Downloading %s tile %d of %d"
+                         % (label, done + 1, total))
+            # Wrap in x so a region straddling the antimeridian still works;
+            # y has no wrap, tiles above the pole simply do not exist.
+            wrapped_x = (tile_x0 + ix) % span
+            tile_y = tile_y0 + iy
+            data = None
+            if 0 <= tile_y < span:
+                data = fetcher.fetch(zoom, wrapped_x, tile_y)
+            if data is None:
+                missing += 1
+                continue
+            fetched += 1
+            patch = decode(data)
+            if patch.shape[:2] != (TILE_PIXELS, TILE_PIXELS):
+                raise GeoImportError(
+                    "%s tile %d/%d/%d is %dx%d, expected %dx%d"
+                    % (label.capitalize(), zoom, wrapped_x, tile_y,
+                       patch.shape[1], patch.shape[0], TILE_PIXELS, TILE_PIXELS))
+            mosaic[iy * TILE_PIXELS:(iy + 1) * TILE_PIXELS,
+                   ix * TILE_PIXELS:(ix + 1) * TILE_PIXELS] = patch
+
+    if fetched == 0:
+        raise GeoImportError(
+            "No %s data was available for this area." % label)
+
+    px = (tx - tile_x0) * TILE_PIXELS
+    py = (ty - tile_y0) * TILE_PIXELS
+    sampled = _bilinear(mosaic, px, py)
+
+    if progress is not None:
+        progress(total, total, "Building terrain")
+    return sampled, zoom, fetched, missing
+
+
+def sample_elevation(request, fetcher, progress=None):
+    """Sample the elevation source over the region's vertex grid.
+
+    Returns ``(elevation_m, zoom, tiles_fetched, tiles_missing)``.
+    """
+    try:
+        sampled, zoom, fetched, missing = _sample_tiles(
+            request, fetcher, _decode_tile, None, "elevation", progress)
+    except GeoImportError as exc:
+        if "No elevation data" in str(exc):
+            raise GeoImportError(
+                "No elevation data was available for this area. If you are "
+                "offline, import from a bitmap instead.") from exc
+        raise
+    return sampled.astype(np.float32), zoom, fetched, missing
+
+
+def sample_basemap(request, fetcher, progress=None):
+    """Sample a raster map source onto the region grid.
+
+    The result is a ``uint8`` RGB array the same width and height as the
+    region's terrain grid, so it can be drawn straight under the region
+    overview: every pixel lines up with the terrain vertex it sits beneath,
+    and therefore with the city tile boundaries drawn on top.
+
+    Returns ``(rgb, zoom, tiles_fetched, tiles_missing)``.
+    """
+    sampled, zoom, fetched, missing = _sample_tiles(
+        request, fetcher, _decode_rgb_tile, 3, "map", progress, fill=255.0)
+    rgb = np.clip(np.rint(sampled), 0, 255).astype(np.uint8)
+    return rgb, zoom, fetched, missing
+
+
+def elevation_to_height_dm(elevation_m, sea_level_m=SEA_LEVEL_M,
+                           vertical_scale=1.0, sea_reference_m=0.0,
+                           ocean_depth_m=20.0, keep_bathymetry=False):
+    """Map real elevations onto SC4's height scale.
+
+    Returns ``(height_dm, clamped_count)``.  Heights are ``uint16``
+    decimetres with sea level at ``sea_level_m``.
+
+    Real bathymetry plunges to -4000 m and, once scaled, would bottom out
+    against zero as a vast pit, so by default anything below the shoreline
+    is flattened to a shallow shelf.  ``keep_bathymetry`` keeps the real
+    sea floor for people who want it.
+    """
+    elevation_m = np.asarray(elevation_m, dtype=np.float64)
+    heights = sea_level_m + (elevation_m - sea_reference_m) * vertical_scale
+
+    if not keep_bathymetry:
+        shelf = sea_level_m - ocean_depth_m
+        heights = np.where(elevation_m < sea_reference_m, shelf, heights)
+
+    decimetres = np.rint(heights * 10.0)
+    clamped = int(np.count_nonzero((decimetres < 0) | (decimetres > 65535)))
+    decimetres = np.clip(decimetres, 0, 65535)
+    return decimetres.astype(np.uint16), clamped
+
+
+def suggested_vertical_scale(max_elevation_m, sea_reference_m=0.0,
+                             headroom_m=MAX_HEIGHT_M - SEA_LEVEL_M - 100.0):
+    """Largest vertical scale that keeps the terrain inside the height range."""
+    relief = max_elevation_m - sea_reference_m
+    if relief <= 0:
+        return 1.0
+    return min(1.0, headroom_m / relief)
+
+
+def build_region_grid(request, fetcher, progress=None):
+    """Fetch, project and convert -- the whole import in one call."""
+    elevation, zoom, fetched, missing = sample_elevation(request, fetcher, progress)
+    height_dm, clamped = elevation_to_height_dm(
+        elevation,
+        sea_level_m=request.sea_level_m,
+        vertical_scale=request.vertical_scale,
+        sea_reference_m=request.sea_reference_m,
+        ocean_depth_m=request.ocean_depth_m,
+        keep_bathymetry=request.keep_bathymetry,
+    )
+    georeference = GeoReference(
+        center_lat=request.center_lat,
+        center_lon=request.center_lon,
+        tiles_x=request.tiles_x,
+        tiles_y=request.tiles_y,
+        metres_per_cell=request.metres_per_cell,
+        rotation_deg=request.rotation_deg,
+        sea_level_m=request.sea_level_m,
+        vertical_scale=request.vertical_scale,
+        sea_reference_m=request.sea_reference_m,
+        zoom=zoom,
+    )
+    return GeoImportResult(
+        height_dm=height_dm,
+        elevation_m=elevation,
+        georeference=georeference,
+        zoom=zoom,
+        tiles_fetched=fetched,
+        tiles_missing=missing,
+        clamped_vertices=clamped,
+    )
+
+
+# --- City tile layout -----------------------------------------------------
+
+# config.bmp encodes city size as a colour: one pixel is one small tile.
+CONFIG_COLORS = {1: (255, 0, 0), 2: (0, 255, 0), 4: (0, 0, 255)}
+#: Anything the game does not recognise as a city colour is a hole.
+CONFIG_VOID = (0, 0, 0)
+CITY_SIZES = (1, 2, 4)
+CITY_SIZE_NAMES = {1: "Small", 2: "Medium", 4: "Large"}
+
+
+def build_config_image(size, preferred=4):
+    """Lay a region footprint out into city tiles.
+
+    ``size`` is ``(width, height)`` in small tiles -- that is, config.bmp
+    pixels.  ``preferred`` is the largest city size to place (1, 2 or 4);
+    whatever will not fit is filled with progressively smaller cities, so
+    the whole footprint is covered.
+
+    This only produces a starting layout.  The user reshapes it afterwards
+    in the region editor, where they can paint individual small, medium and
+    large tiles or punch holes.
+    """
+    width, height = int(size[0]), int(size[1])
+    if width < 1 or height < 1:
+        raise GeoImportError("A region needs at least one tile on each side")
+    if preferred not in CITY_SIZES:
+        raise GeoImportError("City size must be 1, 2 or 4 small tiles")
+
+    image = Image.new("RGB", (width, height), CONFIG_VOID)
+    taken = np.zeros((height, width), dtype=bool)
+
+    for city in (4, 2, 1):
+        if city > preferred:
+            continue
+        for y in range(height - city + 1):
+            for x in range(width - city + 1):
+                if taken[y:y + city, x:x + city].any():
+                    continue
+                taken[y:y + city, x:x + city] = True
+                image.paste(CONFIG_COLORS[city], (x, y, x + city, y + city))
+    return image
+
+
+def describe_layout(size, preferred=4):
+    """Count the cities :func:`build_config_image` would place."""
+    width, height = int(size[0]), int(size[1])
+    image = build_config_image((width, height), preferred)
+    pixels = np.asarray(image)
+    counts = {}
+    for city_size, colour in CONFIG_COLORS.items():
+        matching = np.all(pixels == np.array(colour, dtype=np.uint8), axis=-1)
+        counts[city_size] = int(matching.sum()) // (city_size * city_size)
+    return counts
+
+
+# --- Locating -------------------------------------------------------------
+
+_DECIMAL_PAIR = re.compile(
+    r"^\s*(-?\d+(?:\.\d+)?)\s*[,;/\s]\s*(-?\d+(?:\.\d+)?)\s*$")
+
+_SIGNED_PAIR = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)")
+
+_OSM_HASH = re.compile(r"#map=\d+(?:\.\d+)?/(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)")
+
+_GOOGLE_AT = re.compile(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)")
+
+_GEO_URI = re.compile(r"^geo:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)")
+
+_DMS = re.compile(
+    r"(\d+(?:\.\d+)?)\s*[^\d\w]?\s*"          # degrees
+    r"(?:(\d+(?:\.\d+)?)\s*['′´]?\s*)?"  # minutes
+    r"(?:(\d+(?:\.\d+)?)\s*[\"″]?\s*)?"       # seconds
+    r"([NSEW])", re.IGNORECASE)
+
+
+def _dms_to_decimal(degrees, minutes, seconds, hemisphere):
+    value = float(degrees)
+    if minutes:
+        value += float(minutes) / 60.0
+    if seconds:
+        value += float(seconds) / 3600.0
+    if hemisphere.upper() in ("S", "W"):
+        value = -value
+    return value
+
+
+def parse_location(text):
+    """Parse a latitude/longitude out of whatever the user pasted.
+
+    Understands decimal pairs, degrees/minutes/seconds, ``geo:`` URIs, and
+    OpenStreetMap and Google Maps URLs.  Returns ``(lat, lon)`` or ``None``.
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    for pattern in (_OSM_HASH, _GOOGLE_AT, _GEO_URI):
+        match = pattern.search(text)
+        if match:
+            return _validated(float(match.group(1)), float(match.group(2)))
+
+    # Query strings such as ?mlat=52.37&mlon=4.90 or ?q=52.37,4.90
+    parsed = urllib.parse.urlparse(text)
+    if parsed.query:
+        params = urllib.parse.parse_qs(parsed.query)
+        if "mlat" in params and "mlon" in params:
+            try:
+                return _validated(float(params["mlat"][0]), float(params["mlon"][0]))
+            except ValueError:
+                pass
+        for key in ("q", "query", "ll", "center"):
+            if key in params:
+                match = _SIGNED_PAIR.search(params[key][0])
+                if match:
+                    return _validated(float(match.group(1)), float(match.group(2)))
+
+    dms = _DMS.findall(text)
+    if len(dms) >= 2:
+        values = {}
+        for degrees, minutes, seconds, hemisphere in dms[:2]:
+            decimal = _dms_to_decimal(degrees, minutes, seconds, hemisphere)
+            axis = "lat" if hemisphere.upper() in ("N", "S") else "lon"
+            values.setdefault(axis, decimal)
+        if "lat" in values and "lon" in values:
+            return _validated(values["lat"], values["lon"])
+
+    match = _DECIMAL_PAIR.match(text)
+    if match:
+        return _validated(float(match.group(1)), float(match.group(2)))
+
+    return None
+
+
+def _validated(lat, lon):
+    """Return the pair only if it is a plausible coordinate."""
+    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return (lat, lon)
+    return None
+
+
+@dataclass
+class Place:
+    """One geocoding result."""
+
+    name: str
+    lat: float
+    lon: float
+
+
+#: Nominatim's usage policy requires an identifying User-Agent and only
+#: light, user-initiated traffic -- one search per button press, never
+#: search-as-you-type.
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+
+def geocode(query, limit=8, timeout=20, user_agent=None, opener=None):
+    """Look a place name up with Nominatim.
+
+    ``opener`` lets tests substitute the network call; it is given the
+    request URL and must return the raw JSON bytes.
+    """
+    import json
+
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    params = urllib.parse.urlencode({
+        "q": query,
+        "format": "jsonv2",
+        "limit": str(int(limit)),
+    })
+    url = "%s?%s" % (NOMINATIM_URL, params)
+    agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
+
+    if opener is not None:
+        payload = opener(url)
+    else:
+        request = urllib.request.Request(url, headers={"User-Agent": agent})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = response.read()
+        except urllib.error.URLError as exc:
+            raise GeoImportError("Could not reach the search service (%s)."
+                                 % getattr(exc, "reason", exc)) from exc
+
+    try:
+        results = json.loads(payload)
+    except ValueError as exc:
+        raise GeoImportError("The search service returned an unreadable reply") from exc
+
+    places = []
+    for item in results:
+        try:
+            places.append(Place(name=item.get("display_name", "?"),
+                                lat=float(item["lat"]),
+                                lon=float(item["lon"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return places

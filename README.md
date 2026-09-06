@@ -19,6 +19,64 @@ less build and install friction.
   rendering, and DBPF save round-trips.
 - Replaced the old installer/batch packaging flow with a PyInstaller build.
 
+## Real-World Locations
+
+Besides importing a heightmap, SC4Mapper can build a region directly from
+real-world elevation data. **Create Region -> Real-world location** asks for
+a place and the shape of the region to cut out of it:
+
+![The location dialog](doc/geo/location-dialog.jpg)
+
+- **Where** takes a place name, a coordinate pair, or a pasted OpenStreetMap
+  or Google Maps link. Place-name lookup uses OpenStreetMap's Nominatim
+  service, one search per button press.
+- **Metres per cell** is the scale. SimCity 4 cells are 16 m, so 16 is true
+  scale; larger values squeeze more real ground into the same region. The
+  dialog shows the resulting footprint in kilometres as you type.
+- **Start layout with** picks the city size to pack the region with. Whatever
+  does not fit is filled with smaller cities.
+- **Vertical exaggeration** scales relief. Real slopes at true scale are
+  often too steep to build on, so mountainous areas usually want a value
+  below 1.
+- Sea level is SimCity 4's 250 m datum. By default everything below the
+  real shoreline is flattened to a shallow shelf, because scaled ocean
+  bathymetry would otherwise bottom out as a pit.
+
+Elevation comes from the [Mapzen/AWS terrain
+tiles](https://registry.opendata.aws/terrain-tiles/): global coverage, open
+data, no API key. Tiles are cached on disk, so re-importing an area is
+offline and instant.
+
+### Laying Out City Tiles
+
+The import produces a starting layout you then reshape with **Edit
+Config.bmp** -- paint small, medium or large cities over the imported
+terrain, or erase tiles to leave holes:
+
+![Editing the city layout over imported terrain](doc/geo/region-layout.jpg)
+
+Blue outlines are large cities, green medium, red small; hatched tiles are
+holes. Enabling `basemap_url` (see below) draws a real map underneath the
+terrain so you can see what you are turning into city tiles.
+
+### Map Underlay
+
+`config/SC4Mapper.ini` has a `[geo]` section:
+
+```ini
+[geo]
+elevation_url = https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
+basemap_url =
+basemap_opacity = 0.55
+```
+
+`basemap_url` is empty by default and the underlay is switched off. Unlike
+the elevation source, general map and imagery providers each set their own
+terms -- OpenStreetMap's tile policy, for instance, forbids distributed
+applications from drawing on their servers -- so choosing a provider, and
+supplying any API key it needs, is left to you. Any XYZ tile URL works;
+note that some providers order the path `{z}/{y}/{x}`.
+
 ## Running From Source
 
 Install [uv](https://docs.astral.sh/uv/), then:
