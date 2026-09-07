@@ -1523,9 +1523,7 @@ class OverView(wx.Frame):
                 i += 1
                 dlgProg.Update(i, "Please wait while loading the region")
                 imSmall = im.crop((x * 64, y * 64, x * 64 + 65, y * 64 + 65))
-                r = Numeric.frombuffer(imSmall.tobytes(), Numeric.int32)
-                r = Numeric.reshape(r, (64 + 1, 64 + 1))
-                r = r.astype(Numeric.uint16)
+                r = png16.to_uint16_array(imSmall)
                 heights[y * 64:y * 64 + 65, x * 64:x * 64 + 65] = r
                 del r
                 del imSmall
