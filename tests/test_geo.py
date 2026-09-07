@@ -964,6 +964,32 @@ def test_no_basemap_is_configured_by_default():
     assert geo.BASEMAP_PRESETS == {}
 
 
+def test_footprint_preview_uses_a_fixed_small_canvas():
+    image, zoom, fetched, missing = geo.build_footprint_preview(
+        request(tiles_x=8, tiles_y=6), ImageryFetcher(), size=(320, 240))
+    pixels = np.asarray(image)
+    assert image.size == (320, 240)
+    assert zoom >= 0 and fetched > 0 and missing == 0
+    assert np.any(np.all(pixels == (20, 55, 255), axis=-1))
+
+
+def test_footprint_preview_makes_rotation_visible():
+    straight, _, _, _ = geo.build_footprint_preview(
+        request(tiles_x=8, tiles_y=4), ImageryFetcher(), size=(320, 240))
+    rotated, _, _, _ = geo.build_footprint_preview(
+        request(tiles_x=8, tiles_y=4, rotation_deg=35),
+        ImageryFetcher(), size=(320, 240))
+    assert not np.array_equal(np.asarray(straight), np.asarray(rotated))
+
+
+def test_footprint_preview_can_fall_back_to_elevation():
+    image, _, fetched, _ = geo.build_footprint_preview(
+        request(), ConstantFetcher(120.0), imagery=False, size=(160, 120))
+    assert image.mode == "RGB"
+    assert image.size == (160, 120)
+    assert fetched > 0
+
+
 # --- locating -------------------------------------------------------------
 
 

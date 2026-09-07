@@ -54,6 +54,10 @@ MAPPER_VERSION = get_version()
 SCROLL_RATE = 1
 
 
+class ImportCancelled(Exception):
+    """Raised when the user cancels a geographic import."""
+
+
 class CreateRgnFromFile(wx.Dialog):
     """Dialog for entering region settings (file, size, name, config.bmp)."""
 
@@ -213,6 +217,8 @@ class CreateRgnFromFile(wx.Dialog):
 
 class CreateRgnFromLocationDialog(wx.Dialog):
     """Pick a place on Earth and the shape of the region to cut out of it."""
+
+    PREVIEW_SIZE = (560, 420)
 
     CITY_CHOICES = [("Large cities (4x4)", 4), ("Medium cities (2x2)", 2),
                     ("Small cities (1x1)", 1)]
@@ -381,14 +387,35 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         terrainSizer.Add(self.underlay, 0, wx.ALL, 3)
         if not hasBasemap:
             terrainSizer.Add(wx.StaticText(
-                self, -1, "Set basemap_url in SC4Mapper.ini to enable the "
-                          "underlay."), 0, wx.LEFT | wx.BOTTOM, 5)
+                self, -1, "Set a basemap tile URL in Options to enable the "
+                          "underlay and use it for previews."),
+                0, wx.LEFT | wx.BOTTOM, 5)
+
+        blank = wx.Image(*self.PREVIEW_SIZE)
+        blank.SetRGB(wx.Rect(0, 0, *self.PREVIEW_SIZE), 235, 238, 240)
+        self.previewBitmap = wx.StaticBitmap(self, bitmap=wx.Bitmap(blank))
+        self.btnPreview = wx.Button(self, -1, "Refresh preview")
+        self.previewNote = wx.StaticText(
+            self, -1, "Preview the exact footprint before importing.")
+        previewBox = wx.StaticBox(self, -1, "Footprint preview")
+        previewSizer = wx.StaticBoxSizer(previewBox, wx.VERTICAL)
+        previewSizer.Add(self.previewBitmap, 0, wx.EXPAND | wx.ALL, 5)
+        previewSizer.Add(self.btnPreview, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        previewSizer.Add(
+            self.previewNote, 0,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        formSizer = wx.BoxSizer(wx.VERTICAL)
+        formSizer.Add(findSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(shapeSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(terrainSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(waterSizer, 0, wx.EXPAND | wx.ALL, 5)
+        contentSizer = wx.BoxSizer(wx.HORIZONTAL)
+        contentSizer.Add(formSizer, 0, wx.EXPAND)
+        contentSizer.Add(previewSizer, 0, wx.EXPAND | wx.ALL, 5)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
-        sizer.Add(findSizer, 0, wx.EXPAND | wx.ALL, 5)
-        sizer.Add(shapeSizer, 0, wx.EXPAND | wx.ALL, 5)
-        sizer.Add(terrainSizer, 0, wx.EXPAND | wx.ALL, 5)
-        sizer.Add(waterSizer, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(contentSizer, 1, wx.EXPAND)
         sizer.Add(wx.StaticLine(self, -1, size=(20, -1),
                                 style=wx.LI_HORIZONTAL), 0, wx.GROW | wx.ALL, 5)
         btnsizer = wx.StdDialogButtonSizer()
@@ -402,10 +429,13 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         sizer.Fit(self)
 
         self.Bind(wx.EVT_BUTTON, self.OnSearch, self.btnSearch)
+        self.Bind(wx.EVT_BUTTON, self.OnPreview, self.btnPreview)
         self.search.Bind(wx.EVT_TEXT_ENTER, self.OnSearch)
         self.results.Bind(wx.EVT_LISTBOX, self.OnPickPlace)
         for control in (self.sizeX, self.sizeY, self.metres):
             control.Bind(wx.EVT_TEXT, self.OnShapeChanged)
+        for control in (self.lat, self.lon, self.rotation):
+            control.Bind(wx.EVT_TEXT, self.OnPreviewChanged)
         self.citySize.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.verticalMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
         self.datumMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
@@ -425,6 +455,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
 
     def OnShapeChanged(self, event):
         """Keep the footprint readout in step with the inputs."""
+        self.MarkPreviewStale()
         try:
             tiles_x = int(self.sizeX.GetValue())
             tiles_y = int(self.sizeY.GetValue())
@@ -449,6 +480,75 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.UpdateVerticalNote(metres)
         self.UpdateDatumNote()
         self.UpdateWaterNote()
+
+    def OnPreviewChanged(self, event):
+        self.MarkPreviewStale()
+        if event is not None:
+            event.Skip()
+
+    def MarkPreviewStale(self):
+        if getattr(self, "_previewReady", False):
+            self.previewNote.SetLabel(
+                "Location or footprint changed; refresh the preview.")
+            self._previewReady = False
+
+    def OnPreview(self, event):
+        """Fetch a low-resolution context map and draw the footprint."""
+        try:
+            request = self.GetRequest()
+        except (ValueError, TypeError) as exc:
+            wx.MessageBox(str(exc), "Check the settings",
+                          wx.OK | wx.ICON_ERROR, self)
+            return
+
+        cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
+        basemapUrl = getattr(self.settings, "basemap_url", "").strip()
+        imagery = bool(basemapUrl)
+        if imagery:
+            fetcher = geo.HttpTileFetcher(
+                url_template=basemapUrl,
+                cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None,
+                timeout=12,
+                attribution=(getattr(self.settings, "basemap_attribution", "")
+                             or None))
+            attribution = (getattr(self.settings, "basemap_attribution", "")
+                           or "Map preview: %s" % basemapUrl)
+        else:
+            elevationUrl = (getattr(self.settings, "elevation_url", "")
+                            or geo.DEFAULT_TILE_URL)
+            fetcher = geo.HttpTileFetcher(
+                url_template=elevationUrl,
+                cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None,
+                timeout=12,
+                attribution=(getattr(self.settings, "elevation_attribution", "")
+                             or None))
+            attribution = "Elevation hillshade preview"
+
+        self.btnPreview.Enable(False)
+        self.previewNote.SetLabel("Downloading low-resolution preview...")
+        wx.BeginBusyCursor()
+        try:
+            image, zoom, fetched, missing = geo.build_footprint_preview(
+                request, fetcher, imagery=imagery, size=self.PREVIEW_SIZE,
+                city_size=self.GetCitySize(),
+                progress=lambda done, total, message: wx.Yield())
+            wxImage = wx.Image(image.width, image.height)
+            wxImage.SetData(image.tobytes())
+            self.previewBitmap.SetBitmap(wx.Bitmap(wxImage))
+            note = "%s - zoom %d, %d tile(s)" % (attribution, zoom, fetched)
+            if missing:
+                note += ", %d missing" % missing
+            self.previewNote.SetLabel(note)
+            self.previewNote.Wrap(self.PREVIEW_SIZE[0])
+            self._previewReady = True
+            self.Layout()
+        except geo.GeoImportError as exc:
+            self.previewNote.SetLabel("Preview unavailable: %s" % exc)
+        except Exception as exc:
+            self.previewNote.SetLabel("Preview failed: %s" % exc)
+        finally:
+            wx.EndBusyCursor()
+            self.btnPreview.Enable(True)
 
     def UpdateWaterNote(self):
         """Explain the OpenStreetMap water options."""
@@ -657,7 +757,9 @@ class PreferencesDialog(wx.Dialog):
         sizer.Add(providers, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         sizer.Add(buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizerAndFit(sizer)
-        self.SetMinSize((720, self.GetSize().height))
+        height = self.GetSize().height
+        self.SetMinSize((720, height))
+        self.SetSize((720, height))
 
     def Apply(self):
         self.settings.import_dir = self.importDir.GetPath()
@@ -1702,9 +1804,9 @@ class OverView(wx.Frame):
                      "16 bit png", "RGB image", wx.ID_CANCEL])
         if result == wx.ID_CANCEL or result is None:
             return
-        self.btnEditMode.Enable(False)
         if result == 'Real-world location':
-            self.CreateRgnFromLocation()
+            return self.CreateRgnFromLocation()
+        self.btnEditMode.Enable(False)
         if result == 'SC4M':
             self.CreateRgnFromSC4M()
         if result == 'Grayscale image':
@@ -1757,20 +1859,23 @@ class OverView(wx.Frame):
         placeName = dlg.search.GetValue().strip()
         dlg.Destroy()
 
-        self.CreateRgnInit()
-
         cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
         elevationUrl = (getattr(self.settings, "elevation_url", "")
                         or geo.DEFAULT_TILE_URL)
 
         progress = wx.ProgressDialog(
             "Importing terrain", "Contacting the elevation server",
-            maximum=100, parent=self, style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE)
+            maximum=100, parent=self,
+            style=(wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT
+                   | wx.PD_ELAPSED_TIME))
 
         def report(done, total, message):
             percent = int(done * 100 / total) if total else 0
-            progress.Update(min(percent, 99), message)
+            response = progress.Update(min(percent, 99), message)
             wx.Yield()
+            keepGoing = response[0] if isinstance(response, tuple) else response
+            if not keepGoing:
+                raise ImportCancelled()
 
         basemap = None
         try:
@@ -1791,8 +1896,13 @@ class OverView(wx.Frame):
                 report(0, 100, "Downloading the map underlay")
                 mapFetcher = geo.HttpTileFetcher(
                     url_template=self.settings.basemap_url,
-                    cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None)
+                    cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None,
+                    attribution=(getattr(self.settings, "basemap_attribution", "")
+                                 or None))
                 basemap, _, _, _ = geo.sample_basemap(request, mapFetcher, report)
+        except ImportCancelled:
+            progress.Destroy()
+            return
         except geo.GeoImportError as exc:
             progress.Destroy()
             wx.MessageBox(str(exc), "Import failed", wx.OK | wx.ICON_ERROR, self)
@@ -1835,6 +1945,9 @@ class OverView(wx.Frame):
                 "Region creation error", wx.OK | wx.ICON_ERROR, self)
             return
 
+        # Keep the existing region available throughout preview/download and
+        # replace it only after the new one has been built successfully.
+        self.CreateRgnInit()
         self.regionName = placeName or ("%.4f,%.4f" % (request.center_lat,
                                                        request.center_lon))
         self.region = newRegion

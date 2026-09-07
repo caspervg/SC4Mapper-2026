@@ -590,7 +590,7 @@ def grid_lonlat(request):
 
 
 def _sample_tiles(request, fetcher, decode, channels, label, progress=None,
-                  fill=0.0):
+                  fill=0.0, sample_lonlat=None, sample_resolution_m=None):
     """Sample a slippy-map tile source over the region's vertex grid.
 
     ``decode`` turns PNG/JPEG bytes into an array; ``channels`` is ``None``
@@ -602,11 +602,15 @@ def _sample_tiles(request, fetcher, decode, channels, label, progress=None,
     Returns ``(sampled, zoom, tiles_fetched, tiles_missing)``.
     """
     request.validate()
-    lon, lat = grid_lonlat(request)
+    if sample_lonlat is None:
+        lon, lat = grid_lonlat(request)
+    else:
+        lon, lat = sample_lonlat
 
     zoom = request.zoom
     if zoom is None:
-        zoom = zoom_for_resolution(request.metres_per_cell, request.center_lat,
+        resolution = sample_resolution_m or request.metres_per_cell
+        zoom = zoom_for_resolution(resolution, request.center_lat,
                                    max_zoom=request.max_zoom)
 
     tx, ty = lonlat_to_tile(lon, lat, zoom)
@@ -702,6 +706,100 @@ def sample_basemap(request, fetcher, progress=None):
         request, fetcher, _decode_rgb_tile, 3, "map", progress, fill=255.0)
     rgb = np.clip(np.rint(sampled), 0, 255).astype(np.uint8)
     return rgb, zoom, fetched, missing
+
+
+def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
+                            city_size=4, progress=None, margin=0.18):
+    """Build a north-up context preview with the region grid overlaid.
+
+    ``imagery`` selects regular RGB XYZ tiles.  When false, Terrarium
+    elevation tiles are converted into a lightweight hillshade, providing a
+    useful fallback when no basemap provider has been configured.
+    """
+    from PIL import ImageDraw
+
+    request.validate()
+    width_px, height_px = int(size[0]), int(size[1])
+    if width_px < 32 or height_px < 32:
+        raise GeoImportError("Preview must be at least 32 pixels on each side")
+
+    width_m = request.tiles_x * CELLS_PER_TILE * request.metres_per_cell
+    height_m = request.tiles_y * CELLS_PER_TILE * request.metres_per_cell
+    corners_e = np.array([-width_m / 2, width_m / 2,
+                          width_m / 2, -width_m / 2], dtype=np.float64)
+    corners_n = np.array([height_m / 2, height_m / 2,
+                          -height_m / 2, -height_m / 2], dtype=np.float64)
+    theta = math.radians(request.rotation_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    rotated_e = corners_e * cos_t + corners_n * sin_t
+    rotated_n = -corners_e * sin_t + corners_n * cos_t
+
+    span_e = max(float(np.ptp(rotated_e)) * (1.0 + 2.0 * margin), 1.0)
+    span_n = max(float(np.ptp(rotated_n)) * (1.0 + 2.0 * margin), 1.0)
+    target_aspect = width_px / float(height_px)
+    if span_e / span_n < target_aspect:
+        span_e = span_n * target_aspect
+    else:
+        span_n = span_e / target_aspect
+    west, east = -span_e / 2.0, span_e / 2.0
+    south, north = -span_n / 2.0, span_n / 2.0
+
+    sample_e = np.linspace(west, east, width_px, dtype=np.float64)
+    sample_n = np.linspace(north, south, height_px, dtype=np.float64)
+    east_grid, north_grid = np.meshgrid(sample_e, sample_n)
+    lon, lat = local_offsets_to_lonlat(
+        request.center_lat, request.center_lon, east_grid, north_grid)
+    resolution = max(span_e / max(1, width_px - 1),
+                     span_n / max(1, height_px - 1))
+
+    if imagery:
+        sampled, zoom, fetched, missing = _sample_tiles(
+            request, fetcher, _decode_rgb_tile, 3, "preview map", progress,
+            fill=255.0, sample_lonlat=(lon, lat),
+            sample_resolution_m=resolution)
+        rgb = np.clip(np.rint(sampled), 0, 255).astype(np.uint8)
+    else:
+        sampled, zoom, fetched, missing = _sample_tiles(
+            request, fetcher, _decode_tile, None, "preview elevation", progress,
+            sample_lonlat=(lon, lat), sample_resolution_m=resolution)
+        elevation = np.asarray(sampled, dtype=np.float32)
+        low, high = np.percentile(elevation, (2, 98))
+        relief = np.clip((elevation - low) / max(float(high - low), 1.0), 0, 1)
+        gradient_y, gradient_x = np.gradient(elevation, resolution, resolution)
+        shade = np.clip(0.72 - gradient_x * 0.8 + gradient_y * 0.5, 0.3, 1.0)
+        rgb = np.stack((55 + relief * 125,
+                        105 + relief * 90,
+                        55 + relief * 105), axis=-1)
+        rgb *= shade[..., None]
+        rgb[elevation <= 0] = (92, 135, 166)
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    image = Image.fromarray(rgb, "RGB")
+    draw = ImageDraw.Draw(image)
+
+    def to_pixel(local_e, local_n):
+        map_e = local_e * cos_t + local_n * sin_t
+        map_n = -local_e * sin_t + local_n * cos_t
+        x = (map_e - west) / span_e * (width_px - 1)
+        y = (north - map_n) / span_n * (height_px - 1)
+        return (float(x), float(y))
+
+    tile_m = CELLS_PER_TILE * request.metres_per_cell
+    for tile_x in range(request.tiles_x + 1):
+        local_e = -width_m / 2.0 + tile_x * tile_m
+        major = tile_x in (0, request.tiles_x) or tile_x % city_size == 0
+        draw.line([to_pixel(local_e, height_m / 2.0),
+                   to_pixel(local_e, -height_m / 2.0)],
+                  fill=(20, 55, 255) if major else (190, 205, 220),
+                  width=3 if major else 1)
+    for tile_y in range(request.tiles_y + 1):
+        local_n = height_m / 2.0 - tile_y * tile_m
+        major = tile_y in (0, request.tiles_y) or tile_y % city_size == 0
+        draw.line([to_pixel(-width_m / 2.0, local_n),
+                   to_pixel(width_m / 2.0, local_n)],
+                  fill=(20, 55, 255) if major else (190, 205, 220),
+                  width=3 if major else 1)
+    return image, zoom, fetched, missing
 
 
 def despike_elevation(elevation_m, threshold_m=200.0):

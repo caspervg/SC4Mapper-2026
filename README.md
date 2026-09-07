@@ -35,6 +35,9 @@ a place and the shape of the region to cut out of it:
   dialog shows the resulting footprint in kilometres as you type.
 - **Start layout with** picks the city size to pack the region with. Whatever
   does not fit is filled with smaller cities.
+- **Refresh preview** downloads a low-resolution, north-up context view and
+  draws the exact rotated footprint and city grid before the full import. It
+  uses the configured basemap, or an elevation hillshade when none is set.
 - **Heights** decides how elevations map onto SimCity 4's vertical axis
   (see below).
 - Sea level is SimCity 4's 250 m datum. By default everything below the
@@ -175,7 +178,12 @@ terrain so you can see what you are turning into city tiles.
 ```ini
 [geo]
 elevation_url = https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
+elevation_attribution = Elevation: Mapzen Terrain Tiles / AWS Open Data
 basemap_url =
+basemap_attribution =
+overpass_urls =
+    https://overpass-api.de/api/interpreter
+    https://overpass.kumi.systems/api/interpreter
 basemap_opacity = 0.55
 ```
 
@@ -185,6 +193,11 @@ terms -- OpenStreetMap's tile policy, for instance, forbids distributed
 applications from drawing on their servers -- so choosing a provider, and
 supplying any API key it needs, is left to you. Any XYZ tile URL works;
 note that some providers order the path `{z}/{y}/{x}`.
+
+These provider URLs and their attribution text can also be changed from
+**File -> Options**. Overpass endpoints are entered one per line and are
+tried in order. Tile caches are kept separate by provider, so changing a URL
+cannot mix old tiles into a new source.
 
 ### Georeference Record
 
