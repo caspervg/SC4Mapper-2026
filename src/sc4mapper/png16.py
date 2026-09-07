@@ -39,3 +39,17 @@ def to_uint16_array(im: Image.Image) -> np.ndarray:
     raise ValueError(
         "not a 16-bit grayscale image (mode %r)" % (im.mode,)
     )
+
+
+def clamp_to_16bit(im: Image.Image) -> Image.Image:
+    """Clamp a mode ``I`` image to ``0..65535``.
+
+    Resampling filters such as bicubic overshoot outside the input range, and
+    mode ``I`` is signed 32-bit with no clamping of its own, so a resized
+    heightmap can hold negative or >65535 samples. Those wrap into wildly
+    wrong altitudes once the importer narrows them to ``uint16``.
+    """
+    a = np.asarray(im, dtype=np.int32)
+    if a.min() >= 0 and a.max() <= 65535:
+        return im
+    return Image.fromarray(np.clip(a, 0, 65535).astype(np.int32), "I")
