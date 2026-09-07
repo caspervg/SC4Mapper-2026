@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 # Pillow mode strings used for 16-bit unsigned grayscale.
-PNG16_MODES = ("I", "I;16", "I;16L", "I;16B", "I;16N")
+PNG16_MODES = ("I", "I;16", "I;16L", "I;16B")
 
 
 def is_16bit_grayscale(im: Image.Image) -> bool:
@@ -32,10 +32,45 @@ def as_mode_i(im: Image.Image) -> Image.Image:
 
 def to_uint16_array(im: Image.Image) -> np.ndarray:
     """Convert a 16-bit grayscale PIL image to a ``uint16`` ``(H, W)`` array."""
-    if im.mode in ("I;16", "I;16L", "I;16B", "I;16N"):
+    if im.mode in ("I;16", "I;16L", "I;16B"):
         return np.asarray(im, dtype=np.uint16)
     if im.mode == "I":
         return np.clip(np.asarray(im, dtype=np.int32), 0, 65535).astype(np.uint16)
     raise ValueError(
         "not a 16-bit grayscale image (mode %r)" % (im.mode,)
     )
+
+
+def clamp_to_16bit(im: Image.Image) -> Image.Image:
+    """Clamp a mode ``I`` image to ``0..65535``.
+
+    Resampling filters such as bicubic overshoot outside the input range, and
+    mode ``I`` is signed 32-bit with no clamping of its own, so a resized
+    heightmap can hold negative or >65535 samples. Those wrap into wildly
+    wrong altitudes once the importer narrows them to ``uint16``.
+    """
+    a = np.asarray(im, dtype=np.int32)
+    if a.min() >= 0 and a.max() <= 65535:
+        return im
+    return Image.fromarray(np.clip(a, 0, 65535).astype(np.int32), "I")
+
+
+def tiles_to_heightmap(im, config_size, progress=None):
+    """Assemble a region heightmap from a 16-bit grayscale image.
+
+    *config_size* is ``(x, y)`` in cities; the image is expected to be
+    ``(x * 64 + 1, y * 64 + 1)`` pixels. Cities are read as overlapping 65x65
+    tiles so adjacent cities share their border row and column. *progress*, if
+    given, is called with the running tile count.
+    """
+    xCities, yCities = config_size
+    heights = np.zeros((yCities * 64 + 1, xCities * 64 + 1), np.uint16)
+    i = 0
+    for y in range(yCities):
+        for x in range(xCities):
+            i += 1
+            if progress is not None:
+                progress(i)
+            tile = im.crop((x * 64, y * 64, x * 64 + 65, y * 64 + 65))
+            heights[y * 64:y * 64 + 65, x * 64:x * 64 + 65] = to_uint16_array(tile)
+    return heights
