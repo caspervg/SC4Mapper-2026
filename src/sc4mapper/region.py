@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 
 from . import gradient
 from . import qfs as QFS
+from .geo import GEOREF_TGI, build_georef_record
 from . import settings
 from . import terrain as terrain
 from .resources import asset_path
@@ -121,9 +122,40 @@ class SaveFile(object):
             self.entries.append(entry)
         self.sc4.close()
 
-    def Save(self, cityXPos, cityYPos, heightMap, saveName):
+    def AddOrReplaceEntry(self, tgi, payload):
+        """Put a raw, uncompressed entry into the archive.
+
+        Used for the georeference record, which is not something SimCity 4
+        knows about -- an unrecognised entry simply rides along beside the
+        ones it does read. Adding one means the index grows, so the header's
+        entry count and index length have to move with it.
+        """
+        for entry in self.entries:
+            if entry.IsItThisTGI(tgi):
+                entry.rawContent = payload
+                entry.content = payload
+                entry.compressed = False
+                entry.filesize = len(payload)
+                return entry
+
+        buffer = struct.pack("<3I2i", tgi[0], tgi[1], tgi[2], 0, len(payload))
+        entry = SC4Entry(buffer, len(self.entries))
+        entry.rawContent = payload
+        entry.content = payload
+        entry.compressed = False
+        entry.filesize = len(payload)
+        self.entries.append(entry)
+        self.indexRecordEntryCount += 1
+        self.indexRecordLength += 20
+        return entry
+
+    def Save(self, cityXPos, cityYPos, heightMap, saveName, georef=None):
         """Save a city: read all entries, create a save file, replace the
         height / city info / region-picture entries, write everything back.
+
+        ``georef`` is an optional payload stored under
+        :data:`sc4mapper.geo.GEOREF_TGI`, recording where in the real world
+        the city came from.
         """
         global generic_saveValue
         self.heightMap = heightMap
@@ -146,6 +178,15 @@ class SaveFile(object):
             if entry.rawContent is None:
                 entry.ReadFile(self.sc4, True)
         self.sc4.close()
+        if georef:
+            self.AddOrReplaceEntry(GEOREF_TGI, georef)
+        # The index grew or shrank with that entry, so the counts in the
+        # header have to be rewritten too, not just the position above.
+        self.header = (self.header[0:0x24]
+                       + struct.pack("<I", self.indexRecordEntryCount)
+                       + self.header[0x24 + 4:0x2C]
+                       + struct.pack("<I", self.indexRecordLength)
+                       + self.header[0x2C + 4:96])
         while True:
             try:
                 self.sc4 = open(saveName, "wb")
@@ -243,7 +284,7 @@ class SaveFile(object):
         return True
 
 
-def Save(city, folder, color, waterLevel):
+def Save(city, folder, color, waterLevel, georef=None):
     """Save a city file and build the thumbnail for the region view."""
     if city.cityXSize == 1:
         name = 'City - Small.sc4'
@@ -257,7 +298,7 @@ def Save(city, folder, color, waterLevel):
     with asset_path(name) as path:
         saved = SaveFile(str(path))
         return saved.Save(city.cityXPos, city.cityYPos, city.heightMap,
-                          city.fileName)
+                          city.fileName, georef=georef)
 
 
 def BuildThumbnail(city, colors, waterLevel):
@@ -690,13 +731,39 @@ class SC4Region(object):
                                            self.waterLevel, citySave.heightMap,
                                            gradient.paletteWater,
                                            gradient.paletteLand, lightDir)
+            georef = self.BuildGeorefRecord(citySave, subRgn)
             try:
-                if not Save(citySave, self.folder, rawRGB, self.waterLevel):
+                if not Save(citySave, self.folder, rawRGB, self.waterLevel,
+                            georef=georef):
                     saved = False
             except Exception:
                 saved = False
             citySave.heightMap = None
         return saved
+
+    def BuildGeorefRecord(self, citySave, subRgn):
+        """Georeference payload for one city, or None if this region has none.
+
+        The offsets are the same slice used to cut this city's heights out of
+        the region grid, so the record stays correct however the region was
+        cropped on the way out.
+        """
+        georeference = getattr(self, "georeference", None)
+        if georeference is None:
+            return None
+        try:
+            return build_georef_record(
+                georeference,
+                offset_x=citySave.xPos + subRgn[0],
+                offset_z=citySave.yPos + subRgn[1],
+                tile_size=citySave.cityXSize,
+                region_name=getattr(self, "regionName", None),
+                import_id=getattr(self, "importId", None),
+                ocean_depth_m=getattr(self, "oceanDepth", 20.0),
+                keep_bathymetry=getattr(self, "keepBathymetry", False),
+            )
+        except Exception:
+            return None
 
     def show(self, dlg, readFiles=False):
         """Compute size/shape and load the height map if readFiles is True."""

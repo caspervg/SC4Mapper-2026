@@ -4,8 +4,11 @@
 
 import os
 import os.path
+import queue
 import struct
 import sys
+import threading
+import uuid
 import zlib
 
 import numpy as Numeric
@@ -16,6 +19,7 @@ from PIL import Image, ImageDraw
 
 from . import about_dialog
 from . import dialogs
+from . import geo
 from . import gradient
 from . import png16
 from . import region
@@ -51,6 +55,10 @@ except Exception:
 
 MAPPER_VERSION = get_version()
 SCROLL_RATE = 1
+
+
+class ImportCancelled(Exception):
+    """Raised when the user cancels a geographic import."""
 
 
 class CreateRgnFromFile(wx.Dialog):
@@ -210,8 +218,494 @@ class CreateRgnFromFile(wx.Dialog):
         dlg.Destroy()
 
 
+class CreateRgnFromLocationDialog(wx.Dialog):
+    """Pick a place on Earth and the shape of the region to cut out of it."""
+
+    PREVIEW_SIZE = (560, 420)
+
+    CITY_CHOICES = [("Large cities (4x4)", 4), ("Medium cities (2x2)", 2),
+                    ("Small cities (1x1)", 1)]
+
+    VERTICAL_CHOICES = [("Match the horizontal scale", "match"),
+                        ("Keep true elevations", "true"),
+                        ("Exaggerate by", "manual")]
+
+    DATUM_CHOICES = [("Real sea level", "sea"),
+                     ("Lowest ground in the area", "lowest"),
+                     ("Elevation (m)", "manual")]
+
+    WATER_CHOICES = [("From elevation only", "elevation"),
+                     ("Add mapped water", "both"),
+                     ("Mapped water only", "mask")]
+
+    def __init__(self, parent, settings):
+        wx.Dialog.__init__(self, parent, -1,
+                           "Create region from a real-world location",
+                           style=wx.DEFAULT_DIALOG_STYLE)
+        self.settings = settings
+        self.places = []
+
+        find = wx.StaticBox(self, -1, "Where")
+        findSizer = wx.StaticBoxSizer(find, wx.VERTICAL)
+        self.search = wx.TextCtrl(self, -1, "", size=(340, -1),
+                                  style=wx.TE_PROCESS_ENTER)
+        self.btnSearch = wx.Button(self, -1, "Find")
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(self.search, 1, wx.EXPAND | wx.ALL, 3)
+        row.Add(self.btnSearch, 0, wx.ALL, 3)
+        findSizer.Add(row, 0, wx.EXPAND)
+        findSizer.Add(wx.StaticText(
+            self, -1, "Type a place name, or paste coordinates or an "
+                      "OpenStreetMap / Google Maps link."),
+            0, wx.LEFT | wx.BOTTOM, 5)
+        self.results = wx.ListBox(self, -1, size=(340, 90))
+        findSizer.Add(self.results, 0, wx.EXPAND | wx.ALL, 3)
+        self.placeDetails = wx.StaticText(self, -1, " ")
+        findSizer.Add(self.placeDetails, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        self.lat = wx.TextCtrl(self, -1, "52.3676", size=(100, -1))
+        self.lon = wx.TextCtrl(self, -1, "4.9041", size=(100, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Latitude"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.lat, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "Longitude"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.lon, 0, wx.ALL, 3)
+        findSizer.Add(row, 0, wx.EXPAND)
+
+        shape = wx.StaticBox(self, -1, "Region")
+        shapeSizer = wx.StaticBoxSizer(shape, wx.VERTICAL)
+        self.sizeX = masked.NumCtrl(self, value=8, integerWidth=3,
+                                    allowNegative=False, min=1)
+        self.sizeY = masked.NumCtrl(self, value=8, integerWidth=3,
+                                    allowNegative=False, min=1)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Size in small tiles"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.sizeX, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "x"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.sizeY, 0, wx.ALL, 3)
+        shapeSizer.Add(row, 0, wx.EXPAND)
+
+        self.metres = wx.TextCtrl(self, -1, "16", size=(60, -1))
+        self.rotation = wx.TextCtrl(self, -1, "0", size=(60, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Metres per cell"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.metres, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "Rotation"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.rotation, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "degrees"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        shapeSizer.Add(row, 0, wx.EXPAND)
+
+        self.citySize = wx.Choice(
+            self, -1, choices=[label for label, _ in self.CITY_CHOICES])
+        self.citySize.SetSelection(0)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Start layout with"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.citySize, 0, wx.ALL, 3)
+        shapeSizer.Add(row, 0, wx.EXPAND)
+        shapeSizer.Add(wx.StaticText(
+            self, -1, "You can repaint individual tiles, or erase them to "
+                      "leave holes, after the import."),
+            0, wx.LEFT | wx.BOTTOM, 5)
+
+        self.footprint = wx.StaticText(self, -1, " ")
+        shapeSizer.Add(self.footprint, 0, wx.ALL, 5)
+
+        terrainBox = wx.StaticBox(self, -1, "Terrain")
+        terrainSizer = wx.StaticBoxSizer(terrainBox, wx.VERTICAL)
+        self.verticalMode = wx.Choice(
+            self, -1, choices=[label for label, _ in self.VERTICAL_CHOICES])
+        self.verticalMode.SetSelection(0)
+        self.vertical = wx.TextCtrl(self, -1, "1.0", size=(60, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Heights"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.verticalMode, 0, wx.ALL, 3)
+        row.Add(self.vertical, 0, wx.ALL, 3)
+        terrainSizer.Add(row, 0, wx.EXPAND)
+        self.verticalNote = wx.StaticText(self, -1, " ")
+        terrainSizer.Add(self.verticalNote, 0, wx.LEFT | wx.BOTTOM, 5)
+        self.datumMode = wx.Choice(
+            self, -1, choices=[label for label, _ in self.DATUM_CHOICES])
+        self.datumMode.SetSelection(0)
+        self.datum = wx.TextCtrl(self, -1, "0", size=(70, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Shoreline at"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.datumMode, 0, wx.ALL, 3)
+        row.Add(self.datum, 0, wx.ALL, 3)
+        terrainSizer.Add(row, 0, wx.EXPAND)
+        self.datumNote = wx.StaticText(self, -1, " ")
+        terrainSizer.Add(self.datumNote, 0, wx.LEFT | wx.BOTTOM, 5)
+
+        self.flatten = wx.CheckBox(
+            self, -1, "Flood everything below the shoreline")
+        self.flatten.SetValue(True)
+        terrainSizer.Add(self.flatten, 0, wx.ALL, 3)
+
+        waterBox = wx.StaticBox(self, -1, "Water from OpenStreetMap")
+        waterSizer = wx.StaticBoxSizer(waterBox, wx.VERTICAL)
+        self.waterSource = wx.Choice(
+            self, -1, choices=[label for label, _ in self.WATER_CHOICES])
+        self.waterSource.SetSelection(0)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Lakes and rivers"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.waterSource, 0, wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+
+        self.minWaterArea = wx.TextCtrl(self, -1, "64", size=(60, -1))
+        self.maxWaterRise = wx.TextCtrl(self, -1, "30", size=(60, -1))
+        self.waterDepth = wx.TextCtrl(self, -1, "3", size=(60, -1))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Ignore smaller than"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.minWaterArea, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "cells, or more than"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.maxWaterRise, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "m above the shoreline"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, -1, "Water depth"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        row.Add(self.waterDepth, 0, wx.ALL, 3)
+        row.Add(wx.StaticText(self, -1, "m"), 0,
+                wx.ALIGN_CENTRE_VERTICAL | wx.ALL, 3)
+        waterSizer.Add(row, 0, wx.EXPAND)
+        self.waterNote = wx.StaticText(self, -1, " ")
+        waterSizer.Add(self.waterNote, 0, wx.LEFT | wx.BOTTOM, 5)
+        self.waterSizer = waterSizer
+        self.underlay = wx.CheckBox(
+            self, -1, "Download a map underlay for the region view")
+        hasBasemap = bool(getattr(settings, "basemap_url", ""))
+        self.underlay.SetValue(hasBasemap)
+        self.underlay.Enable(hasBasemap)
+        terrainSizer.Add(self.underlay, 0, wx.ALL, 3)
+        if not hasBasemap:
+            terrainSizer.Add(wx.StaticText(
+                self, -1, "Set a basemap tile URL in Options to enable the "
+                          "underlay and use it for previews."),
+                0, wx.LEFT | wx.BOTTOM, 5)
+
+        blank = wx.Image(*self.PREVIEW_SIZE)
+        blank.SetRGB(wx.Rect(0, 0, *self.PREVIEW_SIZE), 235, 238, 240)
+        self.previewBitmap = wx.StaticBitmap(self, bitmap=wx.Bitmap(blank))
+        self.btnPreview = wx.Button(self, -1, "Refresh preview")
+        self.previewNote = wx.StaticText(
+            self, -1, "Preview the exact footprint before importing.")
+        previewBox = wx.StaticBox(self, -1, "Footprint preview")
+        previewSizer = wx.StaticBoxSizer(previewBox, wx.VERTICAL)
+        previewSizer.Add(self.previewBitmap, 0, wx.EXPAND | wx.ALL, 5)
+        previewSizer.Add(self.btnPreview, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        previewSizer.Add(
+            self.previewNote, 0,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        formSizer = wx.BoxSizer(wx.VERTICAL)
+        formSizer.Add(findSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(shapeSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(terrainSizer, 0, wx.EXPAND | wx.ALL, 5)
+        formSizer.Add(waterSizer, 0, wx.EXPAND | wx.ALL, 5)
+        contentSizer = wx.BoxSizer(wx.HORIZONTAL)
+        contentSizer.Add(formSizer, 0, wx.EXPAND)
+        contentSizer.Add(previewSizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(contentSizer, 1, wx.EXPAND)
+        sizer.Add(wx.StaticLine(self, -1, size=(20, -1),
+                                style=wx.LI_HORIZONTAL), 0, wx.GROW | wx.ALL, 5)
+        btnsizer = wx.StdDialogButtonSizer()
+        self.btnOk = wx.Button(self, wx.ID_OK)
+        self.btnOk.SetDefault()
+        btnsizer.AddButton(self.btnOk)
+        btnsizer.AddButton(wx.Button(self, wx.ID_CANCEL))
+        btnsizer.Realize()
+        sizer.Add(btnsizer, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.ALL, 5)
+        self.SetSizer(sizer)
+        sizer.Fit(self)
+
+        self.Bind(wx.EVT_BUTTON, self.OnSearch, self.btnSearch)
+        self.Bind(wx.EVT_BUTTON, self.OnPreview, self.btnPreview)
+        self.search.Bind(wx.EVT_TEXT_ENTER, self.OnSearch)
+        self.results.Bind(wx.EVT_LISTBOX, self.OnPickPlace)
+        for control in (self.sizeX, self.sizeY, self.metres):
+            control.Bind(wx.EVT_TEXT, self.OnShapeChanged)
+        for control in (self.lat, self.lon, self.rotation):
+            control.Bind(wx.EVT_TEXT, self.OnPreviewChanged)
+        self.citySize.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.verticalMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.datumMode.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.waterSource.Bind(wx.EVT_CHOICE, self.OnShapeChanged)
+        self.OnShapeChanged(None)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _float(self, control, label, default=None):
+        text = control.GetValue().strip().replace(",", ".")
+        if not text and default is not None:
+            return default
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError("%s must be a number" % label)
+
+    def OnShapeChanged(self, event):
+        """Keep the footprint readout in step with the inputs."""
+        self.MarkPreviewStale()
+        try:
+            tiles_x = int(self.sizeX.GetValue())
+            tiles_y = int(self.sizeY.GetValue())
+            metres = self._float(self.metres, "Metres per cell")
+        except (ValueError, TypeError):
+            self.footprint.SetLabel(" ")
+            return
+        if tiles_x < 1 or tiles_y < 1 or metres <= 0:
+            self.footprint.SetLabel(" ")
+            return
+        width = tiles_x * geo.CELLS_PER_TILE * metres / 1000.0
+        height = tiles_y * geo.CELLS_PER_TILE * metres / 1000.0
+        try:
+            counts = geo.describe_layout((tiles_x, tiles_y), self.GetCitySize())
+        except geo.GeoImportError:
+            counts = {}
+        parts = ["%d %s" % (counts[size], geo.CITY_SIZE_NAMES[size].lower())
+                 for size in (4, 2, 1) if counts.get(size)]
+        self.footprint.SetLabel(
+            "Covers %.1f x %.1f km of real ground - %s"
+            % (width, height, ", ".join(parts) if parts else "no cities"))
+        self.UpdateVerticalNote(metres)
+        self.UpdateDatumNote()
+        self.UpdateWaterNote()
+
+    def OnPreviewChanged(self, event):
+        self.MarkPreviewStale()
+        if event is not None:
+            event.Skip()
+
+    def MarkPreviewStale(self):
+        if getattr(self, "_previewReady", False):
+            self.previewNote.SetLabel(
+                "Location or footprint changed; refresh the preview.")
+            self._previewReady = False
+
+    def OnPreview(self, event):
+        """Fetch a low-resolution context map and draw the footprint."""
+        try:
+            request = self.GetRequest()
+        except (ValueError, TypeError) as exc:
+            wx.MessageBox(str(exc), "Check the settings",
+                          wx.OK | wx.ICON_ERROR, self)
+            return
+
+        cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
+        basemapUrl = getattr(self.settings, "basemap_url", "").strip()
+        imagery = bool(basemapUrl)
+        if imagery:
+            fetcher = geo.HttpTileFetcher(
+                url_template=basemapUrl,
+                cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None,
+                timeout=12,
+                attribution=(getattr(self.settings, "basemap_attribution", "")
+                             or None))
+            attribution = (getattr(self.settings, "basemap_attribution", "")
+                           or "Map preview: %s" % basemapUrl)
+        else:
+            elevationUrl = (getattr(self.settings, "elevation_url", "")
+                            or geo.DEFAULT_TILE_URL)
+            fetcher = geo.HttpTileFetcher(
+                url_template=elevationUrl,
+                cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None,
+                timeout=12,
+                attribution=(getattr(self.settings, "elevation_attribution", "")
+                             or None))
+            attribution = "Elevation hillshade preview"
+
+        self.btnPreview.Enable(False)
+        self.previewNote.SetLabel("Downloading low-resolution preview...")
+        wx.BeginBusyCursor()
+        try:
+            image, zoom, fetched, missing = geo.build_footprint_preview(
+                request, fetcher, imagery=imagery, size=self.PREVIEW_SIZE,
+                city_size=self.GetCitySize(),
+                progress=lambda done, total, message: wx.Yield())
+            wxImage = wx.Image(image.width, image.height)
+            wxImage.SetData(image.tobytes())
+            self.previewBitmap.SetBitmap(wx.Bitmap(wxImage))
+            note = "%s - zoom %d, %d tile(s)" % (attribution, zoom, fetched)
+            if missing:
+                note += ", %d missing" % missing
+            self.previewNote.SetLabel(note)
+            self.previewNote.Wrap(self.PREVIEW_SIZE[0])
+            self._previewReady = True
+            self.Layout()
+        except geo.GeoImportError as exc:
+            self.previewNote.SetLabel("Preview unavailable: %s" % exc)
+        except Exception as exc:
+            self.previewNote.SetLabel("Preview failed: %s" % exc)
+        finally:
+            wx.EndBusyCursor()
+            self.btnPreview.Enable(True)
+
+    def UpdateWaterNote(self):
+        """Explain the OpenStreetMap water options."""
+        mode = self.GetWaterSource()
+        for control in (self.minWaterArea, self.maxWaterRise, self.waterDepth):
+            control.Enable(mode != "elevation")
+        notes = {
+            "elevation": "Water is decided by the shoreline alone. No lookup "
+                         "is made.",
+            "both": "Mapped sea, lakes, and rivers are added to what the "
+                    "shoreline already floods.",
+            "mask": "Only mapped water is wet; everything else is raised to "
+                    "dry land however low it sits. Use for coasts and polders.",
+        }
+        self.waterNote.SetLabel(notes[mode])
+
+    def GetWaterSource(self):
+        index = max(0, self.waterSource.GetSelection())
+        return self.WATER_CHOICES[index][1]
+
+    def UpdateDatumNote(self):
+        """Explain which real elevation becomes SimCity 4's shoreline."""
+        mode = self.GetDatumMode()
+        self.datum.Enable(mode == "manual")
+        notes = {
+            "sea": "Real sea level becomes SimCity 4's shoreline. Right for "
+                   "the coast; inland, it leaves the whole area on high ground.",
+            "lowest": "The shoreline is dropped below the lowest ground here, "
+                      "so nothing floods. Use for land below sea level, such "
+                      "as polders.",
+            "manual": "The elevation entered becomes the shoreline. For a "
+                      "mountain lake, use its surface height.",
+        }
+        self.datumNote.SetLabel(notes[mode])
+
+    def GetDatumMode(self):
+        index = max(0, self.datumMode.GetSelection())
+        return self.DATUM_CHOICES[index][1]
+
+    def UpdateVerticalNote(self, metres_per_cell):
+        """Explain what the chosen height mode will do at this scale."""
+        mode = self.GetVerticalMode()
+        self.vertical.Enable(mode == "manual")
+        if mode == "manual":
+            self.verticalNote.SetLabel(
+                "Heights are multiplied by the factor above.")
+            return
+        if mode == "true":
+            note = ("Real metres, kept as they are. A cell is always 16 m "
+                    "in game, so at %.0f m per cell slopes come out %.1fx "
+                    "steeper than life."
+                    % (metres_per_cell, metres_per_cell / geo.CELL_SIZE_M))
+        else:
+            scale = geo.isotropic_vertical_scale(metres_per_cell)
+            note = ("Heights scaled %.2fx so hills keep their real profile."
+                    % scale)
+        self.verticalNote.SetLabel(note)
+
+    def GetVerticalMode(self):
+        index = max(0, self.verticalMode.GetSelection())
+        return self.VERTICAL_CHOICES[index][1]
+
+    def GetCitySize(self):
+        index = max(0, self.citySize.GetSelection())
+        return self.CITY_CHOICES[index][1]
+
+    def OnSearch(self, event):
+        text = self.search.GetValue().strip()
+        if not text:
+            return
+        # A pasted coordinate or link needs no network round trip.
+        located = geo.parse_location(text)
+        if located:
+            self.SetLatLon(*located)
+            self.results.Clear()
+            self.places = []
+            self.placeDetails.SetLabel("Coordinates entered directly")
+            return
+        wx.BeginBusyCursor()
+        try:
+            self.places = geo.geocode(text)
+        except geo.GeoImportError as exc:
+            wx.EndBusyCursor()
+            wx.MessageBox(str(exc), "Search failed", wx.OK | wx.ICON_ERROR, self)
+            return
+        wx.EndBusyCursor()
+        self.results.Clear()
+        if not self.places:
+            wx.MessageBox("Nothing found for %r." % text, "No results",
+                          wx.OK | wx.ICON_INFORMATION, self)
+            return
+        for place in self.places:
+            self.results.Append(place.label)
+        self.results.SetSelection(0)
+        self.SelectPlace(0)
+
+    def OnPickPlace(self, event):
+        index = self.results.GetSelection()
+        if 0 <= index < len(self.places):
+            self.SelectPlace(index)
+
+    def SelectPlace(self, index):
+        place = self.places[index]
+        self.SetLatLon(place.lat, place.lon)
+        self.placeDetails.SetLabel(place.details() or "Location point")
+        self.placeDetails.Wrap(420)
+        self.Layout()
+
+    def SetLatLon(self, lat, lon):
+        self.lat.SetValue("%.6f" % lat)
+        self.lon.SetValue("%.6f" % lon)
+
+    def GetRequest(self):
+        """Build the import request, raising ValueError on bad input."""
+        lat = self._float(self.lat, "Latitude")
+        lon = self._float(self.lon, "Longitude")
+        metres = self._float(self.metres, "Metres per cell")
+        rotation = self._float(self.rotation, "Rotation", 0.0)
+        vertical = self._float(self.vertical, "Vertical exaggeration", 1.0)
+        datum = self._float(self.datum, "Shoreline elevation", 0.0)
+        minArea = self._float(self.minWaterArea, "Minimum water size", 64.0)
+        maxRise = self._float(self.maxWaterRise, "Maximum water rise", 30.0)
+        depth = self._float(self.waterDepth, "Water depth", 3.0)
+        request = geo.GeoImportRequest(
+            center_lat=lat,
+            center_lon=lon,
+            tiles_x=int(self.sizeX.GetValue()),
+            tiles_y=int(self.sizeY.GetValue()),
+            metres_per_cell=metres,
+            rotation_deg=rotation,
+            vertical_mode=self.GetVerticalMode(),
+            vertical_scale=vertical,
+            water_datum_mode=self.GetDatumMode(),
+            sea_reference_m=datum,
+            water_source=self.GetWaterSource(),
+            min_water_area_cells=int(max(0.0, minArea)),
+            max_water_rise_m=max(0.0, maxRise),
+            water_depth_m=max(0.1, depth),
+            keep_bathymetry=not self.flatten.GetValue(),
+        )
+        try:
+            request.validate()
+        except geo.GeoImportError as exc:
+            raise ValueError(str(exc))
+        return request
+
+    def WantsUnderlay(self):
+        return self.underlay.IsEnabled() and self.underlay.GetValue()
+
+
 class PreferencesDialog(wx.Dialog):
-    """Edit default folders and the visible colour-gradient INI."""
+    """Edit default folders and geographic data providers."""
 
     def __init__(self, parent, settings):
         wx.Dialog.__init__(self, parent, -1, "Options",
@@ -236,6 +730,33 @@ class PreferencesDialog(wx.Dialog):
                      0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(control, 1, wx.EXPAND)
 
+        self.elevationUrl = wx.TextCtrl(
+            self, value=getattr(settings, "elevation_url", ""))
+        self.elevationAttribution = wx.TextCtrl(
+            self, value=getattr(settings, "elevation_attribution", ""))
+        self.basemapUrl = wx.TextCtrl(
+            self, value=getattr(settings, "basemap_url", ""))
+        self.basemapAttribution = wx.TextCtrl(
+            self, value=getattr(settings, "basemap_attribution", ""))
+        self.overpassUrls = wx.TextCtrl(
+            self, value=getattr(settings, "overpass_urls", ""),
+            size=(-1, 70), style=wx.TE_MULTILINE)
+        providerGrid = wx.FlexGridSizer(cols=2, vgap=8, hgap=8)
+        providerGrid.AddGrowableCol(1, 1)
+        providerFields = [
+            ("Elevation tile URL", self.elevationUrl),
+            ("Elevation attribution", self.elevationAttribution),
+            ("Basemap tile URL", self.basemapUrl),
+            ("Basemap attribution", self.basemapAttribution),
+            ("Overpass URLs", self.overpassUrls),
+        ]
+        for label, control in providerFields:
+            providerGrid.Add(wx.StaticText(self, label=label),
+                             0, wx.ALIGN_CENTER_VERTICAL)
+            providerGrid.Add(control, 1, wx.EXPAND)
+        providers = wx.StaticBoxSizer(wx.VERTICAL, self, "Map providers")
+        providers.Add(providerGrid, 1, wx.EXPAND | wx.ALL, 8)
+
         buttons = wx.StdDialogButtonSizer()
         ok = wx.Button(self, wx.ID_OK)
         ok.SetDefault()
@@ -245,15 +766,25 @@ class PreferencesDialog(wx.Dialog):
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(grid, 1, wx.EXPAND | wx.ALL, 12)
+        sizer.Add(providers, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         sizer.Add(buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizerAndFit(sizer)
-        self.SetMinSize((560, self.GetSize().height))
+        height = self.GetSize().height
+        self.SetMinSize((720, height))
+        self.SetSize((720, height))
 
     def Apply(self):
         self.settings.import_dir = self.importDir.GetPath()
         self.settings.region_dir = self.regionDir.GetPath()
         self.settings.export_dir = self.exportDir.GetPath()
         self.settings.image_save_dir = self.imageSaveDir.GetPath()
+        self.settings.elevation_url = self.elevationUrl.GetValue().strip()
+        self.settings.elevation_attribution = (
+            self.elevationAttribution.GetValue().strip())
+        self.settings.basemap_url = self.basemapUrl.GetValue().strip()
+        self.settings.basemap_attribution = (
+            self.basemapAttribution.GetValue().strip())
+        self.settings.overpass_urls = self.overpassUrls.GetValue().strip()
         self.settings.save()
 
 
@@ -282,6 +813,7 @@ class OverViewCanvas(wx.ScrolledWindow):
         self._terrainBmp = None
         self._terrainZoom = None
         self._terrainRegion = None
+        self._terrainShowMap = False
         self.OnSize(None)
 
     def _EnsureTerrainCache(self, zoom):
@@ -289,8 +821,10 @@ class OverViewCanvas(wx.ScrolledWindow):
         only have to blit from this bitmap instead of recolouring each frame.
         """
         region = self.parent.region
+        showMap = self.parent.ShowBasemap()
         if (self._terrainBmp is not None and self._terrainZoom == zoom
-                and self._terrainRegion is region):
+                and self._terrainRegion is region
+                and self._terrainShowMap == showMap):
             return
         lightDir = Normalize((1, -5, -1))
         heightMap = region.height[::zoom, ::zoom].astype(Numeric.float32)
@@ -299,11 +833,36 @@ class OverViewCanvas(wx.ScrolledWindow):
             False, heightMap.shape, region.waterLevel, heightMap,
             gradient.paletteWater,
             gradient.paletteLand, lightDir)
+        if showMap:
+            rawRGB = self._BlendBasemap(rawRGB, region, zoom, heightMap.shape)
         img = wx.Image(heightMap.shape[1], heightMap.shape[0])
         img.SetData(rawRGB)
         self._terrainBmp = wx.Bitmap(img)
         self._terrainZoom = zoom
         self._terrainRegion = region
+        self._terrainShowMap = showMap
+
+    def _BlendBasemap(self, rawRGB, region, zoom, shape):
+        """Mix the downloaded map into the terrain colours.
+
+        The basemap was sampled onto the same grid as the height map, so
+        decimating it by the same zoom step keeps it registered: a pixel of
+        the map is the patch of ground under that terrain vertex, and the
+        city rectangles drawn on top land exactly where those cities will.
+        """
+        basemap = getattr(region, "basemap", None)
+        if basemap is None:
+            return rawRGB
+        basemap = basemap[::zoom, ::zoom]
+        if basemap.shape[:2] != tuple(shape):
+            return rawRGB
+        colours = Numeric.frombuffer(rawRGB, dtype=Numeric.uint8)
+        colours = colours.reshape(shape[0], shape[1], 3).astype(Numeric.float32)
+        alpha = float(getattr(self.parent.settings, "basemap_opacity", 0.55))
+        alpha = min(1.0, max(0.0, alpha))
+        blended = (basemap.astype(Numeric.float32) * alpha
+                   + colours * (1.0 - alpha))
+        return Numeric.clip(blended, 0, 255).astype(Numeric.uint8).tobytes()
 
     def OnKeyDown(self, event):
         if (self.parent.btnEditMode.GetValue()
@@ -642,6 +1201,11 @@ class OverView(wx.Frame):
         self.overlayCbx.Bind(wx.EVT_CHECKBOX, self.OnOverlay)
         self.overlayCbx.SetValue(True)
 
+        self.mapCbx = wx.CheckBox(self, wx.ID_ANY, u"Map\nunderlay")
+        self.mapCbx.Bind(wx.EVT_CHECKBOX, self.OnBasemap)
+        self.mapCbx.SetValue(True)
+        self.mapCbx.Enable(False)
+
         self.btnEditMode = wx.ToggleButton(self, wx.ID_ANY, "Edit\nConfig.bmp")
         self.Bind(wx.EVT_TOGGLEBUTTON, self.OnToggleEditMode, self.btnEditMode)
 
@@ -679,6 +1243,7 @@ class OverView(wx.Frame):
         boxh.Add(self.btnZoomIn, 0, wx.ALIGN_CENTER_VERTICAL)
         boxh.Add(self.btnZoomOut, 0, wx.ALIGN_CENTER_VERTICAL)
         boxh.Add(self.overlayCbx, 0, wx.ALIGN_CENTER_VERTICAL)
+        boxh.Add(self.mapCbx, 0, wx.ALIGN_CENTER_VERTICAL)
         boxh.Add(wx.StaticLine(self, wx.ID_ANY, wx.DefaultPosition,
                                wx.DefaultSize, wx.LI_VERTICAL), 0,
                  wx.EXPAND | wx.RIGHT | wx.LEFT, 5)
@@ -711,6 +1276,7 @@ class OverView(wx.Frame):
         self.btnSaveRgn.Enable(False)
         self.btnSave.Enable(False)
         self.overlayCbx.Enable(False)
+        self.mapCbx.Enable(False)
         self.btnEditMode.Enable(False)
         self.btnExportRgn.Enable(False)
         self.Center()
@@ -840,6 +1406,20 @@ class OverView(wx.Frame):
         self.Thaw()
 
     def OnOverlay(self, event):
+        self.Freeze()
+        self.back.UpdateDrawing()
+        self.back.Refresh()
+        self.Thaw()
+
+    def ShowBasemap(self):
+        """True when a map underlay exists and the user wants to see it."""
+        if self.region is None:
+            return False
+        if getattr(self.region, "basemap", None) is None:
+            return False
+        return self.mapCbx.IsEnabled() and self.mapCbx.GetValue()
+
+    def OnBasemap(self, event):
         self.Freeze()
         self.back.UpdateDrawing()
         self.back.Refresh()
@@ -1232,10 +1812,12 @@ class OverView(wx.Frame):
     def CreateRgn(self, event):
         result = dialogs.ask_question(
             'Do you want to create a region from ?',
-            buttons=["SC4M", "Grayscale image", "16 bit png", "RGB image",
-                     wx.ID_CANCEL])
+            buttons=["Real-world location", "SC4M", "Grayscale image",
+                     "16 bit png", "RGB image", wx.ID_CANCEL])
         if result == wx.ID_CANCEL or result is None:
             return
+        if result == 'Real-world location':
+            return self.CreateRgnFromLocation()
         self.btnEditMode.Enable(False)
         if result == 'SC4M':
             self.CreateRgnFromSC4M()
@@ -1270,6 +1852,181 @@ class OverView(wx.Frame):
         self.back.offX = 0
         self.back.offY = 0
         self.back.OnSize(None)
+
+    def CreateRgnFromLocation(self):
+        """Build a region from real-world elevation data."""
+        dlg = CreateRgnFromLocationDialog(self, self.settings)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        try:
+            request = dlg.GetRequest()
+        except ValueError as exc:
+            dlg.Destroy()
+            wx.MessageBox(str(exc), "Check the settings",
+                          wx.OK | wx.ICON_ERROR, self)
+            return
+        citySize = dlg.GetCitySize()
+        wantUnderlay = dlg.WantsUnderlay()
+        placeName = dlg.search.GetValue().strip()
+        dlg.Destroy()
+
+        cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
+        elevationUrl = (getattr(self.settings, "elevation_url", "")
+                        or geo.DEFAULT_TILE_URL)
+
+        progress = wx.ProgressDialog(
+            "Importing terrain", "Contacting the elevation server",
+            maximum=100, parent=self,
+            style=(wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT
+                   | wx.PD_ELAPSED_TIME))
+
+        updates = queue.SimpleQueue()
+        cancelled = threading.Event()
+        outcome = {}
+
+        def report(done, total, message):
+            if cancelled.is_set():
+                raise ImportCancelled()
+            percent = int(done * 100 / total) if total else 0
+            updates.put((min(percent, 99), message))
+
+        def import_worker():
+            try:
+                waterMask = None
+                if request.water_source != "elevation":
+                    water = geo.OverpassClient(
+                        cache_dir=(os.path.join(cacheDir, "osm")
+                                   if cacheDir else None),
+                        timeout=30,
+                        mirrors=self.settings.overpass_endpoints() or None)
+                    waterMask = geo.fetch_water_mask(request, water, report)
+                fetcher = geo.HttpTileFetcher(
+                    url_template=elevationUrl,
+                    cache_dir=(os.path.join(cacheDir, "elevation")
+                               if cacheDir else None),
+                    attribution=(getattr(
+                        self.settings, "elevation_attribution", "") or None))
+                result = geo.build_region_grid(
+                    request, fetcher, report, water_mask=waterMask)
+                basemap = None
+                if wantUnderlay:
+                    report(0, 100, "Downloading the map underlay")
+                    mapFetcher = geo.HttpTileFetcher(
+                        url_template=self.settings.basemap_url,
+                        cache_dir=(os.path.join(cacheDir, "basemap")
+                                   if cacheDir else None),
+                        attribution=(getattr(
+                            self.settings, "basemap_attribution", "") or None))
+                    basemap, _, _, _ = geo.sample_basemap(
+                        request, mapFetcher, report)
+                outcome["result"] = result
+                outcome["basemap"] = basemap
+            except Exception as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=import_worker, daemon=True)
+        worker.start()
+        latest = (0, "Contacting the elevation server")
+        while worker.is_alive():
+            changed = False
+            try:
+                while True:
+                    latest = updates.get_nowait()
+                    changed = True
+            except queue.Empty:
+                pass
+            if changed:
+                response = progress.Update(latest[0], latest[1])
+            else:
+                response = progress.Pulse(latest[1])
+            keepGoing = response[0] if isinstance(response, tuple) else response
+            if not keepGoing:
+                cancelled.set()
+                progress.Destroy()
+                return
+            wx.YieldIfNeeded()
+            worker.join(0.05)
+        progress.Destroy()
+
+        error = outcome.get("error")
+        if isinstance(error, ImportCancelled):
+            return
+        if isinstance(error, geo.GeoImportError):
+            wx.MessageBox(str(error), "Import failed",
+                          wx.OK | wx.ICON_ERROR, self)
+            return
+        if error is not None:
+            wx.MessageBox("Unexpected problem while importing: %s" % error,
+                          "Import failed", wx.OK | wx.ICON_ERROR, self)
+            return
+        result = outcome["result"]
+        basemap = outcome["basemap"]
+
+        config = geo.build_config_image((request.tiles_x, request.tiles_y),
+                                        citySize)
+
+        class dlgstub:
+            def __init__(self):
+                pass
+
+            def Update(self, x, y):
+                pass
+
+        wx.BeginBusyCursor()
+        try:
+            newRegion = region.SC4Region(None, request.sea_level_m, dlgstub(),
+                                         config)
+            newRegion.show(dlgstub())
+        except AssertionError:
+            wx.EndBusyCursor()
+            wx.MessageBox("The generated city layout was rejected. This is a "
+                          "bug -- please report the region size you used.",
+                          "Region creation error", wx.OK | wx.ICON_ERROR, self)
+            return
+
+        if tuple(newRegion.shape) != result.height_dm.shape:
+            wx.EndBusyCursor()
+            wx.MessageBox(
+                "The imported terrain is %dx%d but the region wants %dx%d."
+                % (result.height_dm.shape[1], result.height_dm.shape[0],
+                   newRegion.shape[1], newRegion.shape[0]),
+                "Region creation error", wx.OK | wx.ICON_ERROR, self)
+            return
+
+        # Keep the existing region available throughout preview/download and
+        # replace it only after the new one has been built successfully.
+        self.CreateRgnInit()
+        self.regionName = placeName or ("%.4f,%.4f" % (request.center_lat,
+                                                       request.center_lon))
+        self.region = newRegion
+        self.region.height = result.height_dm
+        self.region.basemap = basemap
+        self.region.georeference = result.georeference
+        # Carried into the georeference record written into each city save.
+        self.region.regionName = self.regionName
+        self.region.importId = uuid.uuid4().hex
+        self.region.oceanDepth = request.ocean_depth_m
+        self.region.keepBathymetry = request.keep_bathymetry
+        self.zoomLevel = 1
+        self.zoomLevelPow = 0
+        self.back.SetVirtualSize((self.region.height.shape[1],
+                                  self.region.height.shape[0]))
+        self.SetFocus()
+        self.CreateRgnOk()
+        self.mapCbx.Enable(basemap is not None)
+        self.btnEditMode.Enable(True)
+        wx.EndBusyCursor()
+
+        summary = result.summary()
+        summary += ("\n\nUse Edit Config.bmp to change which parts become "
+                    "small, medium or large cities, or to erase tiles and "
+                    "leave holes.")
+        if basemap is not None:
+            summary += "\nThe Map underlay checkbox shows the real map behind the region."
+        summary += "\n\n" + result.attribution
+        wx.MessageBox(summary, "Imported %s" % self.regionName,
+                      wx.OK | wx.ICON_INFORMATION, self)
 
     def CreateRgnFromSC4M(self):
         self.CreateRgnInit()
