@@ -231,12 +231,36 @@ class HttpTileFetcher:
     """
 
     def __init__(self, url_template=DEFAULT_TILE_URL, cache_dir=None,
-                 user_agent=None, timeout=30, attribution=None):
+                 user_agent=None, timeout=30, attribution=None,
+                 subdomains=None, layer="m"):
         self.url_template = url_template
         self.cache_dir = cache_dir
         self.timeout = timeout
         self.attribution = attribution
+        if subdomains is None:
+            if "{s}.google." in url_template:
+                subdomains = ("mt0", "mt1", "mt2", "mt3")
+            elif "mt{s}.google." in url_template:
+                subdomains = ("0", "1", "2", "3")
+            else:
+                subdomains = ("a", "b", "c")
+        self.subdomains = tuple(subdomains)
+        self.layer = layer
+        self.last_missing = None
         self.user_agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
+
+    def _tile_url(self, zoom, x, y):
+        subdomain = ""
+        if self.subdomains:
+            subdomain = self.subdomains[(x + y) % len(self.subdomains)]
+        try:
+            return self.url_template.format(
+                z=zoom, x=x, y=y, s=subdomain, l=self.layer)
+        except KeyError as exc:
+            placeholder = str(exc.args[0])
+            raise GeoImportError(
+                "Tile URL uses unsupported placeholder {%s}; use only "
+                "{z}, {x}, {y}, {s} and {l}." % placeholder) from exc
 
     def _cache_path(self, zoom, x, y):
         if not self.cache_dir:
@@ -245,8 +269,9 @@ class HttpTileFetcher:
         # stable namespace per URL template so switching providers cannot
         # silently reuse or mix tiles from the previous source.
         import hashlib
-        source = hashlib.sha256(
-            self.url_template.encode("utf-8")).hexdigest()[:16]
+        identity = "%s\n%s\n%s" % (
+            self.url_template, ",".join(self.subdomains), self.layer)
+        source = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         return os.path.join(
             self.cache_dir, source, str(zoom), str(x), "%d.png" % y)
 
@@ -256,13 +281,14 @@ class HttpTileFetcher:
             with open(path, "rb") as fh:
                 return fh.read()
 
-        url = self.url_template.format(z=zoom, x=x, y=y)
+        url = self._tile_url(zoom, x, y)
         request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 data = response.read()
         except urllib.error.HTTPError as exc:
             if exc.code in (403, 404):
+                self.last_missing = (exc.code, url)
                 return None
             raise GeoImportError("Elevation server returned HTTP %d for %s"
                                  % (exc.code, url)) from exc
@@ -663,8 +689,14 @@ def _sample_tiles(request, fetcher, decode, channels, label, progress=None,
                    ix * TILE_PIXELS:(ix + 1) * TILE_PIXELS] = patch
 
     if fetched == 0:
-        raise GeoImportError(
-            "No %s data was available for this area." % label)
+        message = "No %s data was available for this area." % label
+        last_missing = getattr(fetcher, "last_missing", None)
+        if last_missing:
+            status, url = last_missing
+            message += (" The provider returned HTTP %d for %s; check the "
+                        "tile URL template and any required API key."
+                        % (status, url))
+        raise GeoImportError(message)
 
     px = (tx - tile_x0) * TILE_PIXELS
     py = (ty - tile_y0) * TILE_PIXELS

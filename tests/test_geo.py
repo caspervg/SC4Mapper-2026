@@ -959,6 +959,14 @@ def test_basemap_with_no_data_is_an_error():
         geo.sample_basemap(request(), geo.DictTileFetcher())
 
 
+def test_missing_provider_response_explains_the_bad_url():
+    fetcher = geo.DictTileFetcher()
+    fetcher.last_missing = (404, "https://tiles.example/12/3/4.png")
+    with pytest.raises(geo.GeoImportError, match=(
+            r"HTTP 404.*tiles\.example.*check the tile URL")):
+        geo.sample_basemap(request(), fetcher)
+
+
 def test_no_basemap_is_configured_by_default():
     """Map tile providers each have their own terms, so nothing is presumed."""
     assert geo.BASEMAP_PRESETS == {}
@@ -1106,3 +1114,24 @@ def test_http_cache_is_namespaced_by_provider(tmp_path):
 def test_http_fetcher_builds_the_expected_url():
     fetcher = geo.HttpTileFetcher(url_template="https://example/{z}/{x}/{y}.png")
     assert fetcher.url_template.format(z=1, x=2, y=3) == "https://example/1/2/3.png"
+
+
+def test_http_fetcher_expands_common_tile_placeholders():
+    fetcher = geo.HttpTileFetcher(
+        url_template="https://{s}.google.com/vt/lyrs={l}&x={x}&y={y}&z={z}")
+    assert fetcher._tile_url(7, 1, 2) == (
+        "https://mt3.google.com/vt/lyrs=m&x=1&y=2&z=7")
+
+
+def test_http_fetcher_expands_generic_subdomains():
+    fetcher = geo.HttpTileFetcher(
+        url_template="https://{s}.tiles.example/{z}/{x}/{y}.png")
+    assert fetcher._tile_url(7, 1, 2) == (
+        "https://a.tiles.example/7/1/2.png")
+
+
+def test_http_fetcher_explains_unknown_placeholders():
+    fetcher = geo.HttpTileFetcher(
+        url_template="https://tiles.example/{zoom}/{x}/{y}.png")
+    with pytest.raises(geo.GeoImportError, match=r"unsupported placeholder \{zoom\}"):
+        fetcher._tile_url(7, 1, 2)

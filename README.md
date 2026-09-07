@@ -192,7 +192,11 @@ the elevation source, general map and imagery providers each set their own
 terms -- OpenStreetMap's tile policy, for instance, forbids distributed
 applications from drawing on their servers -- so choosing a provider, and
 supplying any API key it needs, is left to you. Any XYZ tile URL works;
-note that some providers order the path `{z}/{y}/{x}`.
+note that some providers order the path `{z}/{y}/{x}`. Templates may also
+use `{s}` for a rotating tile-server subdomain and `{l}` for a layer code
+(`m` by default). For Google-style `{s}.google.com` templates, `{s}` expands
+to `mt0` through `mt3`; use a literal layer value such as `lyrs=s` when a
+layer other than the default map is wanted.
 
 These provider URLs and their attribution text can also be changed from
 **File -> Options**. Overpass endpoints are entered one per line and are
