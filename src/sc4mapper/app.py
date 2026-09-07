@@ -1758,7 +1758,7 @@ class OverView(wx.Frame):
                 return
         wx.BeginBusyCursor()
 
-        im = Image.new("I", (config.size[0] * 64 + 1, config.size[1] * 64 + 1))
+        im = Image.new("I;16", (config.size[0] * 64 + 1, config.size[1] * 64 + 1))
         dlgProg = wx.ProgressDialog(
             "Exporting as PNG", "Please wait while exporting the region",
             maximum=len(self.region.allCities), parent=self, style=0)
@@ -1772,10 +1772,9 @@ class OverView(wx.Frame):
             heightMap[::, ::] = self.region.height[
                 citySave.yPos + subRgn[1]:citySave.yPos + subRgn[1] + citySave.ySize,
                 citySave.xPos + subRgn[0]:citySave.xPos + subRgn[0] + citySave.xSize]
-            heightMap = heightMap.astype(Numeric.int32)
-            imCity = Image.frombytes("I", (heightMap.shape[1],
-                                           heightMap.shape[0]),
-                                     heightMap.tobytes())
+            imCity = Image.frombytes("I;16", (heightMap.shape[1],
+                                              heightMap.shape[0]),
+                                     heightMap.astype("<u2").tobytes())
             im.paste(imCity, (citySave.xPos, citySave.yPos))
         dlgProg.Close()
         dlgProg.Destroy()
