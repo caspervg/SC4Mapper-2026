@@ -1505,7 +1505,6 @@ class OverView(wx.Frame):
             if res == wx.ID_YES:
                 im = im.resize((configSize[0] * 64 + 1, configSize[1] * 64 + 1),
                                Image.Resampling.BICUBIC)
-                im = png16.as_mode_i(im)
                 im = png16.clamp_to_16bit(im)
             else:
                 return
