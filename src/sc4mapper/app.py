@@ -593,7 +593,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
 
 
 class PreferencesDialog(wx.Dialog):
-    """Edit default folders and the visible colour-gradient INI."""
+    """Edit default folders and geographic data providers."""
 
     def __init__(self, parent, settings):
         wx.Dialog.__init__(self, parent, -1, "Options",
@@ -618,6 +618,33 @@ class PreferencesDialog(wx.Dialog):
                      0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(control, 1, wx.EXPAND)
 
+        self.elevationUrl = wx.TextCtrl(
+            self, value=getattr(settings, "elevation_url", ""))
+        self.elevationAttribution = wx.TextCtrl(
+            self, value=getattr(settings, "elevation_attribution", ""))
+        self.basemapUrl = wx.TextCtrl(
+            self, value=getattr(settings, "basemap_url", ""))
+        self.basemapAttribution = wx.TextCtrl(
+            self, value=getattr(settings, "basemap_attribution", ""))
+        self.overpassUrls = wx.TextCtrl(
+            self, value=getattr(settings, "overpass_urls", ""),
+            size=(-1, 70), style=wx.TE_MULTILINE)
+        providerGrid = wx.FlexGridSizer(cols=2, vgap=8, hgap=8)
+        providerGrid.AddGrowableCol(1, 1)
+        providerFields = [
+            ("Elevation tile URL", self.elevationUrl),
+            ("Elevation attribution", self.elevationAttribution),
+            ("Basemap tile URL", self.basemapUrl),
+            ("Basemap attribution", self.basemapAttribution),
+            ("Overpass URLs", self.overpassUrls),
+        ]
+        for label, control in providerFields:
+            providerGrid.Add(wx.StaticText(self, label=label),
+                             0, wx.ALIGN_CENTER_VERTICAL)
+            providerGrid.Add(control, 1, wx.EXPAND)
+        providers = wx.StaticBoxSizer(wx.VERTICAL, self, "Map providers")
+        providers.Add(providerGrid, 1, wx.EXPAND | wx.ALL, 8)
+
         buttons = wx.StdDialogButtonSizer()
         ok = wx.Button(self, wx.ID_OK)
         ok.SetDefault()
@@ -627,15 +654,23 @@ class PreferencesDialog(wx.Dialog):
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(grid, 1, wx.EXPAND | wx.ALL, 12)
+        sizer.Add(providers, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         sizer.Add(buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizerAndFit(sizer)
-        self.SetMinSize((560, self.GetSize().height))
+        self.SetMinSize((720, self.GetSize().height))
 
     def Apply(self):
         self.settings.import_dir = self.importDir.GetPath()
         self.settings.region_dir = self.regionDir.GetPath()
         self.settings.export_dir = self.exportDir.GetPath()
         self.settings.image_save_dir = self.imageSaveDir.GetPath()
+        self.settings.elevation_url = self.elevationUrl.GetValue().strip()
+        self.settings.elevation_attribution = (
+            self.elevationAttribution.GetValue().strip())
+        self.settings.basemap_url = self.basemapUrl.GetValue().strip()
+        self.settings.basemap_attribution = (
+            self.basemapAttribution.GetValue().strip())
+        self.settings.overpass_urls = self.overpassUrls.GetValue().strip()
         self.settings.save()
 
 
@@ -1742,11 +1777,14 @@ class OverView(wx.Frame):
             waterMask = None
             if request.water_source != "elevation":
                 water = geo.OverpassClient(
-                    cache_dir=os.path.join(cacheDir, "osm") if cacheDir else None)
+                    cache_dir=os.path.join(cacheDir, "osm") if cacheDir else None,
+                    mirrors=self.settings.overpass_endpoints() or None)
                 waterMask = geo.fetch_water_mask(request, water, report)
             fetcher = geo.HttpTileFetcher(
                 url_template=elevationUrl,
-                cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None)
+                cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None,
+                attribution=(getattr(self.settings, "elevation_attribution", "")
+                             or None))
             result = geo.build_region_grid(request, fetcher, report,
                                            water_mask=waterMask)
             if wantUnderlay:

@@ -23,6 +23,7 @@ tile_cache_dir = {config}/tilecache
 # Elevation source for "Real-world location" imports. The default is the
 # Mapzen/AWS terrain tile set: global, open, and no API key required.
 elevation_url = https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
+elevation_attribution = Elevation: Mapzen Terrain Tiles / AWS Open Data
 
 # Optional raster map drawn underneath the region so you can see what you are
 # turning into city tiles. Empty by default: every map and imagery provider
@@ -32,6 +33,12 @@ elevation_url = https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/
 #   basemap_url = https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
 # Note that some providers order the path {z}/{y}/{x} rather than {z}/{x}/{y}.
 basemap_url =
+basemap_attribution =
+
+# Overpass endpoints used for mapped water, tried in order.
+overpass_urls =
+    https://overpass-api.de/api/interpreter
+    https://overpass.kumi.systems/api/interpreter
 
 # How strongly the map underlay shows through the terrain colours, 0.0 - 1.0.
 basemap_opacity = 0.55
@@ -73,8 +80,16 @@ class AppSettings:
     image_save_dir: str
     tile_cache_dir: str = ""
     elevation_url: str = ""
+    elevation_attribution: str = ""
     basemap_url: str = ""
+    basemap_attribution: str = ""
+    overpass_urls: str = ""
     basemap_opacity: float = 0.55
+
+    def overpass_endpoints(self):
+        """Configured Overpass endpoints, in fallback order."""
+        value = self.overpass_urls.replace(",", "\n").replace(";", "\n")
+        return [line.strip() for line in value.splitlines() if line.strip()]
 
     def save(self):
         parser = configparser.ConfigParser()
@@ -92,7 +107,10 @@ class AppSettings:
             parser.add_section("geo")
         parser["geo"] = {
             "elevation_url": self.elevation_url,
+            "elevation_attribution": self.elevation_attribution,
             "basemap_url": self.basemap_url,
+            "basemap_attribution": self.basemap_attribution,
+            "overpass_urls": self.overpass_urls,
             "basemap_opacity": str(self.basemap_opacity),
         }
         with open(self.config_file, "w", encoding="utf-8") as fh:
@@ -182,6 +200,9 @@ def load(default_region_dir=None):
         image_save_dir=image_save_dir,
         tile_cache_dir=tile_cache_dir,
         elevation_url=geo.get("elevation_url", "").strip(),
+        elevation_attribution=geo.get("elevation_attribution", "").strip(),
         basemap_url=geo.get("basemap_url", "").strip(),
+        basemap_attribution=geo.get("basemap_attribution", "").strip(),
+        overpass_urls=geo.get("overpass_urls", "").strip(),
         basemap_opacity=min(1.0, max(0.0, basemap_opacity)),
     )
