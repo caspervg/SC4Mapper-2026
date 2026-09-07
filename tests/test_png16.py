@@ -1,6 +1,7 @@
 """Tests for 16-bit grayscale PNG heightmap loading."""
 
 import io
+import pathlib
 
 import numpy as np
 from PIL import Image
@@ -30,17 +31,31 @@ def test_true_16bit_grayscale_png_is_accepted():
     np.testing.assert_array_equal(got, src)
 
 
-def test_mode_i_export_png_roundtrip():
-    """PNGs written the way ExportAsPNG does (mode I) must still import."""
-    src = np.array([[0, 250, 1000], [32767, 40000, 65535]], dtype=np.uint16)
-    im = Image.frombytes("I", (src.shape[1], src.shape[0]),
-                         src.astype(np.int32).tobytes())
-    opened = _open_png(_png_bytes(im))
+def test_legacy_mode_i_export_png_roundtrip():
+    """PNGs written by older versions (via mode I) must still import.
+
+    Read from a stored fixture rather than written here: saving mode I as
+    PNG is deprecated in Pillow 12 and removed in Pillow 13. The on-disk
+    result is byte-identical to a mode I;16 save either way, so the fixture
+    faithfully represents what old ExportAsPNG produced.
+    """
+    path = pathlib.Path(__file__).parent / "data" / "legacy_export_mode_i.png"
+    opened = Image.open(path)
+    opened.load()
+
     assert png16.is_16bit_grayscale(opened)
     as_i = png16.as_mode_i(opened)
     assert as_i.mode == "I"
-    raw = np.frombuffer(as_i.tobytes(), np.int32).reshape(src.shape)
-    np.testing.assert_array_equal(raw.astype(np.uint16), src)
+
+    values = png16.to_uint16_array(opened)
+    assert values.shape == (65, 65)
+    # Sentinels placed at generation time, spanning the full 16-bit range.
+    assert values[0, 0] == 0
+    assert values[0, 1] == 65535
+    assert values[32, 32] == 32768
+    assert values[64, 64] == 1
+    raw = np.frombuffer(as_i.tobytes(), np.int32).reshape(65, 65)
+    np.testing.assert_array_equal(raw.astype(np.uint16), values)
 
 
 def test_8bit_grayscale_png_is_rejected():
