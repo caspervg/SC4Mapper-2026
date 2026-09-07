@@ -6,6 +6,7 @@ handed to the code through :class:`sc4mapper.geo.DictTileFetcher`.
 
 import io
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -739,6 +740,15 @@ def test_georeference_records_the_scale():
     assert geo_ref.height_m == pytest.approx(2 * 64 * 32.0)
 
 
+def test_pipeline_records_the_actual_elevation_source():
+    fetcher = ConstantFetcher(0.0)
+    fetcher.url_template = "https://terrain.example/{z}/{x}/{y}.png"
+    fetcher.attribution = "Example Terrain"
+    result = geo.build_region_grid(request(), fetcher)
+    assert result.georeference.source == fetcher.url_template
+    assert result.attribution == "Example Terrain"
+
+
 def test_summary_mentions_clamping():
     result = geo.build_region_grid(request(), ConstantFetcher(20000.0))
     assert result.clamped_vertices > 0
@@ -1047,14 +1057,24 @@ def test_dict_fetcher_records_requests():
 
 
 def test_http_fetcher_uses_the_cache(tmp_path):
-    cached = tmp_path / "7" / "3" / "5.png"
+    fetcher = geo.HttpTileFetcher(cache_dir=str(tmp_path))
+    cached = Path(fetcher._cache_path(7, 3, 5))
     cached.parent.mkdir(parents=True)
     cached.write_bytes(b"cached-tile")
 
-    fetcher = geo.HttpTileFetcher(cache_dir=str(tmp_path))
     # No network is configured in the test environment; a cache hit must not
     # attempt one.
     assert fetcher.fetch(7, 3, 5) == b"cached-tile"
+
+
+def test_http_cache_is_namespaced_by_provider(tmp_path):
+    first = geo.HttpTileFetcher(
+        url_template="https://first.example/{z}/{x}/{y}.png",
+        cache_dir=str(tmp_path))
+    second = geo.HttpTileFetcher(
+        url_template="https://second.example/{z}/{x}/{y}.png",
+        cache_dir=str(tmp_path))
+    assert first._cache_path(7, 3, 5) != second._cache_path(7, 3, 5)
 
 
 def test_http_fetcher_builds_the_expected_url():

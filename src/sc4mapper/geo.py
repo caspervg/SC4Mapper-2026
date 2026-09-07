@@ -231,16 +231,24 @@ class HttpTileFetcher:
     """
 
     def __init__(self, url_template=DEFAULT_TILE_URL, cache_dir=None,
-                 user_agent=None, timeout=30):
+                 user_agent=None, timeout=30, attribution=None):
         self.url_template = url_template
         self.cache_dir = cache_dir
         self.timeout = timeout
+        self.attribution = attribution
         self.user_agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
 
     def _cache_path(self, zoom, x, y):
         if not self.cache_dir:
             return None
-        return os.path.join(self.cache_dir, str(zoom), str(x), "%d.png" % y)
+        # Tile coordinates are meaningful only within one provider.  Keep a
+        # stable namespace per URL template so switching providers cannot
+        # silently reuse or mix tiles from the previous source.
+        import hashlib
+        source = hashlib.sha256(
+            self.url_template.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(
+            self.cache_dir, source, str(zoom), str(x), "%d.png" % y)
 
     def fetch(self, zoom, x, y):
         path = self._cache_path(zoom, x, y)
@@ -870,6 +878,14 @@ def build_region_grid(request, fetcher, progress=None, water_mask=None):
             height_dm, effective, sea_level_m=request.sea_level_m,
             water_depth_m=request.water_depth_m)
 
+    source = getattr(fetcher, "url_template", DEFAULT_TILE_URL)
+    attribution = getattr(fetcher, "attribution", None)
+    if not attribution:
+        if source == DEFAULT_TILE_URL:
+            attribution = DEFAULT_ATTRIBUTION
+        else:
+            attribution = "Elevation source: %s" % source
+
     georeference = GeoReference(
         center_lat=request.center_lat,
         center_lon=request.center_lon,
@@ -880,6 +896,7 @@ def build_region_grid(request, fetcher, progress=None, water_mask=None):
         sea_level_m=request.sea_level_m,
         vertical_scale=vertical_scale,
         sea_reference_m=sea_reference,
+        source=source,
         zoom=zoom,
     )
     return GeoImportResult(
@@ -898,6 +915,7 @@ def build_region_grid(request, fetcher, progress=None, water_mask=None):
         slopes=slope_statistics(height_dm),
         water_fraction=float(np.count_nonzero(height_dm < request.sea_level_m * 10)
                              / height_dm.size),
+        attribution=attribution,
     )
 
 
