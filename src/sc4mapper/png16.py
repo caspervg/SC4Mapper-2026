@@ -53,3 +53,24 @@ def clamp_to_16bit(im: Image.Image) -> Image.Image:
     if a.min() >= 0 and a.max() <= 65535:
         return im
     return Image.fromarray(np.clip(a, 0, 65535).astype(np.int32), "I")
+
+
+def tiles_to_heightmap(im, config_size, progress=None):
+    """Assemble a region heightmap from a 16-bit grayscale image.
+
+    *config_size* is ``(x, y)`` in cities; the image is expected to be
+    ``(x * 64 + 1, y * 64 + 1)`` pixels. Cities are read as overlapping 65x65
+    tiles so adjacent cities share their border row and column. *progress*, if
+    given, is called with the running tile count.
+    """
+    xCities, yCities = config_size
+    heights = np.zeros((yCities * 64 + 1, xCities * 64 + 1), np.uint16)
+    i = 0
+    for y in range(yCities):
+        for x in range(xCities):
+            i += 1
+            if progress is not None:
+                progress(i)
+            tile = im.crop((x * 64, y * 64, x * 64 + 65, y * 64 + 65))
+            heights[y * 64:y * 64 + 65, x * 64:x * 64 + 65] = to_uint16_array(tile)
+    return heights

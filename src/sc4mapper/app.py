@@ -1514,18 +1514,10 @@ class OverView(wx.Frame):
             maximum=configSize[1] * configSize[0] + 10, parent=self, style=0)
 
         wx.BeginBusyCursor()
-        heights = Numeric.zeros((configSize[1] * 64 + 1, configSize[0] * 64 + 1),
-                                Numeric.uint16)
-        i = 0
-        for y in range(configSize[1]):
-            for x in range(configSize[0]):
-                i += 1
-                dlgProg.Update(i, "Please wait while loading the region")
-                imSmall = im.crop((x * 64, y * 64, x * 64 + 65, y * 64 + 65))
-                r = png16.to_uint16_array(imSmall)
-                heights[y * 64:y * 64 + 65, x * 64:x * 64 + 65] = r
-                del r
-                del imSmall
+        heights = png16.tiles_to_heightmap(
+            im, configSize,
+            lambda i: dlgProg.Update(
+                i, "Please wait while loading the region"))
 
         dlgProg.Close()
         dlgProg.Destroy()
