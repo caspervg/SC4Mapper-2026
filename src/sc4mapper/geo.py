@@ -1048,6 +1048,48 @@ class OverpassClient:
         return data
 
 
+def _same_ring_point(left, right, tolerance=1e-9):
+    """Whether two lon/lat vertices describe the same OSM node."""
+    return (abs(left[0] - right[0]) <= tolerance
+            and abs(left[1] - right[1]) <= tolerance)
+
+
+def _assemble_rings(fragments):
+    """Join open Overpass member ways into closed polygon rings.
+
+    Multipolygon relations normally split a boundary across several member
+    ways.  ``out geom`` gives each member's coordinates separately, so they
+    must be joined at matching endpoints before Pillow is allowed to fill
+    them.  Any fragment chain that cannot be closed is ignored rather than
+    inventing a straight closing edge across the region.
+    """
+    pending = [list(fragment) for fragment in fragments if len(fragment) >= 2]
+    rings = []
+    while pending:
+        chain = pending.pop(0)
+        while not _same_ring_point(chain[0], chain[-1]):
+            joined = False
+            for index, fragment in enumerate(pending):
+                if _same_ring_point(chain[-1], fragment[0]):
+                    chain.extend(fragment[1:])
+                elif _same_ring_point(chain[-1], fragment[-1]):
+                    chain.extend(reversed(fragment[:-1]))
+                elif _same_ring_point(chain[0], fragment[-1]):
+                    chain = fragment[:-1] + chain
+                elif _same_ring_point(chain[0], fragment[0]):
+                    chain = list(reversed(fragment[1:])) + chain
+                else:
+                    continue
+                pending.pop(index)
+                joined = True
+                break
+            if not joined:
+                break
+        if len(chain) >= 4 and _same_ring_point(chain[0], chain[-1]):
+            rings.append(chain)
+    return rings
+
+
 def parse_overpass_water(data):
     """Pull water rings out of an Overpass ``out geom`` response.
 
@@ -1068,21 +1110,23 @@ def parse_overpass_water(data):
             ring = [(float(p["lon"]), float(p["lat"]))
                     for p in element.get("geometry", []) or []
                     if isinstance(p, dict) and "lon" in p and "lat" in p]
-            if len(ring) >= 3:
+            if (len(ring) >= 4
+                    and _same_ring_point(ring[0], ring[-1])):
                 outers.append(ring)
         elif kind == "relation":
+            fragments = {"outer": [], "inner": []}
             for member in element.get("members", []) or []:
                 if not isinstance(member, dict):
                     continue
                 ring = [(float(p["lon"]), float(p["lat"]))
                         for p in member.get("geometry", []) or []
                         if isinstance(p, dict) and "lon" in p and "lat" in p]
-                if len(ring) < 3:
+                if len(ring) < 2:
                     continue
-                if member.get("role") == "inner":
-                    inners.append(ring)
-                else:
-                    outers.append(ring)
+                role = "inner" if member.get("role") == "inner" else "outer"
+                fragments[role].append(ring)
+            outers.extend(_assemble_rings(fragments["outer"]))
+            inners.extend(_assemble_rings(fragments["inner"]))
     return outers, inners
 
 

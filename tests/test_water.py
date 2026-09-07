@@ -34,14 +34,20 @@ def square_around(request, half_cells):
 
 
 def way(ring, tags=None):
+    if ring and ring[0] != ring[-1]:
+        ring = list(ring) + [ring[0]]
     return {"type": "way", "id": 1, "tags": tags or {"natural": "water"},
             "geometry": [{"lat": p[1], "lon": p[0]} for p in ring]}
 
 
 def relation(outer, inners=(), tags=None):
+    if outer and outer[0] != outer[-1]:
+        outer = list(outer) + [outer[0]]
     members = [{"type": "way", "ref": 10, "role": "outer",
                 "geometry": [{"lat": p[1], "lon": p[0]} for p in outer]}]
     for i, inner in enumerate(inners):
+        if inner and inner[0] != inner[-1]:
+            inner = list(inner) + [inner[0]]
         members.append({"type": "way", "ref": 20 + i, "role": "inner",
                         "geometry": [{"lat": p[1], "lon": p[0]} for p in inner]})
     return {"type": "relation", "id": 2, "tags": tags or {"natural": "water"},
@@ -111,6 +117,38 @@ def test_parses_a_multipolygon_with_a_hole():
         {"elements": [relation(outer, [inner])]})
     assert len(outers) == 1
     assert len(inners) == 1
+
+
+def test_assembles_fragmented_multipolygon_members():
+    points = [(5.0, 52.0), (5.2, 52.0), (5.2, 52.2), (5.0, 52.2)]
+    members = []
+    for index, (start, end) in enumerate(zip(points, points[1:] + points[:1])):
+        members.append({
+            "type": "way", "ref": 100 + index, "role": "outer",
+            "geometry": [
+                {"lon": start[0], "lat": start[1]},
+                {"lon": end[0], "lat": end[1]},
+            ],
+        })
+    outers, inners = geo.parse_overpass_water({
+        "elements": [{"type": "relation", "members": members}],
+    })
+    assert len(outers) == 1
+    assert len(outers[0]) == 5
+    assert not inners
+
+
+def test_drops_open_way_instead_of_closing_it_with_a_chord():
+    element = {
+        "type": "way",
+        "geometry": [
+            {"lon": 5.0, "lat": 52.0},
+            {"lon": 5.1, "lat": 52.1},
+            {"lon": 5.2, "lat": 52.0},
+        ],
+    }
+    outers, inners = geo.parse_overpass_water({"elements": [element]})
+    assert not outers and not inners
 
 
 def test_members_without_a_role_count_as_outer():
