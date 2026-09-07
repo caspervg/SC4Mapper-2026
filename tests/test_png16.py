@@ -61,3 +61,47 @@ def test_as_mode_i_preserves_peaks():
     assert got[10, 10] == 65535
     assert got[20, 30] == 250
     assert got[0, 0] == 0
+
+
+def test_clamp_to_16bit_catches_bicubic_overshoot():
+    """Bicubic ringing at a sharp elevation edge must not survive as wrap bait.
+
+    Resampling ocean-against-plateau undershoots below 0 in mode I. Left
+    alone those samples wrap into near-maximum terrain along the coastline
+    the moment anything narrows them to uint16.
+    """
+    src = np.zeros((257, 257), dtype=np.uint16)
+    src[:, 128:] = 30000
+    im = Image.fromarray(src.astype(np.int32), "I")
+    resized = im.resize((513, 513), Image.Resampling.BICUBIC)
+
+    raw = np.asarray(resized, dtype=np.int32)
+    assert raw.min() < 0, "expected bicubic to undershoot for this fixture"
+    # What an unguarded narrowing would have produced.
+    assert raw.astype(np.uint16).max() > 60000
+
+    # Assert on the clamp's own output, not through to_uint16_array, which
+    # clips on its own and would mask a regression here.
+    clamped = np.asarray(png16.clamp_to_16bit(resized), dtype=np.int32)
+    assert clamped.min() >= 0
+    assert clamped.max() <= 65535
+    assert clamped.astype(np.uint16).max() < 40000
+
+
+def test_clamp_to_16bit_is_identity_when_in_range():
+    im = Image.fromarray(
+        np.array([[0, 30000, 65535]], dtype=np.uint16).astype(np.int32), "I")
+    assert png16.clamp_to_16bit(im) is im
+
+
+def test_to_uint16_array_clips_out_of_range_mode_i():
+    """Mode I is signed 32-bit; narrowing must clip, never wrap.
+
+    This is what actually protects the region importer -- a raw
+    ``astype(uint16)`` turns -1 into 65535 and 70000 into 4464.
+    """
+    src = np.array([[-5000, -1, 0, 250, 65535, 70000]], dtype=np.int32)
+    im = Image.fromarray(src, "I")
+    out = png16.to_uint16_array(im)
+    assert out.dtype == np.uint16
+    np.testing.assert_array_equal(out, [[0, 0, 0, 250, 65535, 65535]])
