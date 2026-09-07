@@ -562,10 +562,10 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         notes = {
             "elevation": "Water is decided by the shoreline alone. No lookup "
                          "is made.",
-            "both": "Lakes and rivers from OpenStreetMap are added to what "
-                    "the shoreline already floods. Best for the coast.",
+            "both": "Mapped sea, lakes, and rivers are added to what the "
+                    "shoreline already floods.",
             "mask": "Only mapped water is wet; everything else is raised to "
-                    "dry land however low it sits. Use for polders.",
+                    "dry land however low it sits. Use for coasts and polders.",
         }
         self.waterNote.SetLabel(notes[mode])
 

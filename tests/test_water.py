@@ -40,6 +40,11 @@ def way(ring, tags=None):
             "geometry": [{"lat": p[1], "lon": p[0]} for p in ring]}
 
 
+def coastline(points):
+    return {"type": "way", "id": 3, "tags": {"natural": "coastline"},
+            "geometry": [{"lat": p[1], "lon": p[0]} for p in points]}
+
+
 def relation(outer, inners=(), tags=None):
     if outer and outer[0] != outer[-1]:
         outer = list(outer) + [outer[0]]
@@ -74,6 +79,7 @@ def test_query_covers_the_water_tags():
     for key, value in geo.WATER_AREA_TAGS:
         assert "way[%s=%s]" % (key, value) in query
         assert "relation[%s=%s]" % (key, value) in query
+    assert "way[natural=coastline]" in query
 
 
 def test_query_avoids_quoted_tag_values():
@@ -165,6 +171,13 @@ def test_degenerate_rings_are_dropped():
     assert not outers and not inners
 
 
+def test_parses_coastline_without_treating_it_as_a_water_ring():
+    points = [(5.0, 52.1), (5.0, 52.0), (5.0, 51.9)]
+    data = {"elements": [coastline(points)]}
+    assert geo.parse_overpass_coastlines(data) == [points]
+    assert geo.parse_overpass_water(data) == ([], [])
+
+
 @pytest.mark.parametrize("data", [
     None, {}, {"elements": []}, {"elements": None}, {"elements": [None, 3]},
     {"elements": [{"type": "node", "lat": 1, "lon": 2}]},
@@ -213,6 +226,60 @@ def test_mask_follows_rotation():
     b = geo.rasterize_water(turned, [ring])
     assert a.any() and b.any()
     assert not np.array_equal(a, b)
+
+
+def test_coastline_fills_the_sea_on_its_right():
+    req = request()
+    lon, lat = geo.grid_lonlat(req)
+    middle = req.grid_shape[1] // 2
+    # Travelling south, east/land is on the left and west/sea on the right.
+    line = [(lon[0, middle], lat[0, middle]),
+            (lon[-1, middle], lat[-1, middle])]
+    mask = geo.rasterize_coastlines(req, [line])
+    row = req.grid_shape[0] // 2
+    assert mask[row, middle // 2]
+    assert not mask[row, middle + middle // 2]
+
+
+def test_reversing_a_coastline_flips_the_sea_side():
+    req = request()
+    lon, lat = geo.grid_lonlat(req)
+    middle = req.grid_shape[1] // 2
+    line = [(lon[-1, middle], lat[-1, middle]),
+            (lon[0, middle], lat[0, middle])]
+    mask = geo.rasterize_coastlines(req, [line])
+    row = req.grid_shape[0] // 2
+    assert not mask[row, middle // 2]
+    assert mask[row, middle + middle // 2]
+
+
+def test_tight_coastline_turn_does_not_seed_the_land_mass():
+    """One ambiguous harbour-scale segment must not flood all dry land."""
+    req = request()
+    rows, cols = req.grid_shape
+    row = rows // 2
+    cells = [(row, -2), (row, cols - 8), (row - 2, cols - 8),
+             (row - 2, cols - 12), (row - 5, cols - 12),
+             (row - 5, cols + 2)]
+    east = np.array([(c - (cols - 1) / 2.0) * req.metres_per_cell
+                     for r, c in cells])
+    north = np.array([((rows - 1) / 2.0 - r) * req.metres_per_cell
+                      for r, c in cells])
+    lon, lat = geo.local_offsets_to_lonlat(
+        req.center_lat, req.center_lon, east, north)
+    line = list(zip(lon, lat))
+    mask = geo.rasterize_coastlines(req, [line])
+    assert mask[row + 10, cols // 2]
+    assert not mask[row - 10, cols // 2]
+
+
+def test_incomplete_coastline_does_not_flood_around_its_ends():
+    req = request()
+    lon, lat = geo.grid_lonlat(req)
+    row, cols = req.grid_shape[0] // 2, req.grid_shape[1]
+    line = [(lon[row, 10], lat[row, 10]),
+            (lon[row, cols - 11], lat[row, cols - 11])]
+    assert not geo.rasterize_coastlines(req, [line]).any()
 
 
 # --- applying the mask ----------------------------------------------------
@@ -422,6 +489,21 @@ def test_fetch_water_mask_end_to_end(tmp_path):
     rows, cols = req.grid_shape
     assert mask.shape == (rows, cols)
     assert mask[rows // 2, cols // 2]
+
+
+def test_fetch_water_mask_includes_the_ocean(tmp_path):
+    req = request()
+    lon, lat = geo.grid_lonlat(req)
+    middle = req.grid_shape[1] // 2
+    line = [(lon[0, middle], lat[0, middle]),
+            (lon[-1, middle], lat[-1, middle])]
+    payload = json.dumps({"elements": [coastline(line)]}).encode("utf-8")
+    client = geo.OverpassClient(cache_dir=str(tmp_path),
+                                opener=lambda url, q: payload)
+    mask = geo.fetch_water_mask(req, client)
+    row = req.grid_shape[0] // 2
+    assert mask[row, middle // 2]
+    assert not mask[row, middle + middle // 2]
 
 
 def test_fetch_water_mask_reports_progress(tmp_path):

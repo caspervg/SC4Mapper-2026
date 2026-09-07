@@ -117,7 +117,7 @@ what the water mask below is for.
 
 ### Water From OpenStreetMap
 
-Under **Water from OpenStreetMap**, lakes and rivers can be looked up
+Under **Water from OpenStreetMap**, the sea, lakes, and rivers can be looked up
 directly rather than inferred from elevation. Two rules are applied, and
 both matter:
 
@@ -128,15 +128,17 @@ The second rule is what makes a polder work. Together they cut the wet/dry
 question loose from elevation entirely, which a shoreline datum can never
 do. Interlaken imports with both lakes at their real outlines and the
 valley between them dry, without tuning a datum at all; Amsterdam imports
-with its waterways wet and its polders dry.
+with its waterways wet and its polders dry. Coastal regions such as Ostend
+also get their sea from OSM's directed coastline, so the same mask can keep
+the North Sea wet without flooding low land behind the dunes and dikes.
 
 Three settings:
 
 - **From elevation only** -- no lookup, the behaviour above.
 - **Add mapped water** -- mapped water on top of whatever the shoreline
-  already floods. Right for the coast, where the sea comes from elevation.
+  already floods. Useful when elevation is a trustworthy fallback.
 - **Mapped water only** -- the map is the whole truth. Use where elevation
-  lies about water, which is anywhere built on land below sea level.
+  lies about water, including coastal land below sea level and polders.
 
 Two filters guard against nonsense, both adjustable:
 

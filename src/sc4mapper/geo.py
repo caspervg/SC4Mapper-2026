@@ -958,9 +958,12 @@ def fetch_water_mask(request, client, progress=None):
     query = build_water_query(region_bbox(request))
     data = client.fetch(query)
     outers, inners = parse_overpass_water(data)
+    coastlines = parse_overpass_coastlines(data)
     if progress is not None:
-        progress(1, 1, "Tracing %d water outline(s)" % len(outers))
-    return rasterize_water(request, outers, inners)
+        progress(1, 1, "Tracing %d water outline(s)"
+                 % (len(outers) + len(coastlines)))
+    return (rasterize_water(request, outers, inners)
+            | rasterize_coastlines(request, coastlines))
 
 
 def build_region_grid(request, fetcher, progress=None, water_mask=None):
@@ -1063,13 +1066,6 @@ OVERPASS_MIRRORS = (
 OVERPASS_URL = OVERPASS_MIRRORS[0]
 
 #: Tags that describe a body of water as an *area*.
-#:
-#: Coastline is deliberately absent. It is tagged as open ways with land on
-#: the left rather than closed polygons, and turning that into a sea polygon
-#: means assembling and clipping it against the region -- a job in itself.
-#: The sea is also the one case elevation already handles well, so the mask
-#: covers what elevation cannot: inland water, and water sitting on ground
-#: below sea level.
 WATER_AREA_TAGS = (
     ("natural", "water"),
     ("waterway", "riverbank"),
@@ -1093,6 +1089,9 @@ def build_water_query(bbox, timeout=90):
         # from the service being down.
         clauses.append("way[%s=%s](%s);" % (key, value, box))
         clauses.append("relation[%s=%s](%s);" % (key, value, box))
+    # Coastlines are directed open ways, with land on the left. They need a
+    # separate raster pass rather than being treated as closed water areas.
+    clauses.append("way[natural=coastline](%s);" % box)
     return ("[out:json][timeout:%d];\n(\n  %s\n);\nout geom;"
             % (int(timeout), "\n  ".join(clauses)))
 
@@ -1258,6 +1257,8 @@ def parse_overpass_water(data):
             continue
         kind = element.get("type")
         if kind == "way":
+            if (element.get("tags") or {}).get("natural") == "coastline":
+                continue
             ring = [(float(p["lon"]), float(p["lat"]))
                     for p in element.get("geometry", []) or []
                     if isinstance(p, dict) and "lon" in p and "lat" in p]
@@ -1279,6 +1280,29 @@ def parse_overpass_water(data):
             outers.extend(_assemble_rings(fragments["outer"]))
             inners.extend(_assemble_rings(fragments["inner"]))
     return outers, inners
+
+
+def parse_overpass_coastlines(data):
+    """Return directed OSM coastline ways as lists of ``(lon, lat)``.
+
+    OpenStreetMap stores coastlines with land on the left and sea on the
+    right. Preserving the node order lets :func:`rasterize_coastlines` decide
+    which side of each line is ocean without consulting elevation.
+    """
+    coastlines = []
+    if not isinstance(data, dict):
+        return coastlines
+    for element in data.get("elements", []) or []:
+        if not isinstance(element, dict) or element.get("type") != "way":
+            continue
+        if (element.get("tags") or {}).get("natural") != "coastline":
+            continue
+        line = [(float(p["lon"]), float(p["lat"]))
+                for p in element.get("geometry", []) or []
+                if isinstance(p, dict) and "lon" in p and "lat" in p]
+        if len(line) >= 2:
+            coastlines.append(line)
+    return coastlines
 
 
 def rasterize_water(request, outers, inners=(), fetcher_shape=None):
@@ -1318,6 +1342,97 @@ def rasterize_water(request, outers, inners=(), fetcher_shape=None):
             draw.polygon(points, fill=0, outline=0)
 
     return np.array(canvas, dtype=bool)
+
+
+def rasterize_coastlines(request, coastlines, fetcher_shape=None):
+    """Fill the sea on the right-hand side of directed OSM coastlines.
+
+    The coastline pixels form a barrier. The connected areas on either side
+    are scored from directed coastline samples, with right-side length voting
+    for sea and left-side length voting for land. This works for both mainland
+    coasts and islands without mistaking below-sea-level land for sea.
+    """
+    from PIL import ImageDraw
+
+    rows, cols = fetcher_shape or request.grid_shape
+    barrier_image = Image.new("1", (cols, rows), 0)
+    draw = ImageDraw.Draw(barrier_image)
+    side_samples = []
+
+    def to_pixels(line):
+        lons = np.array([p[0] for p in line], dtype=np.float64)
+        lats = np.array([p[1] for p in line], dtype=np.float64)
+        east, north = lonlat_to_local_offsets(
+            request.center_lat, request.center_lon, lons, lats)
+        if request.rotation_deg:
+            theta = math.radians(request.rotation_deg)
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            east, north = (east * cos_t - north * sin_t,
+                           east * sin_t + north * cos_t)
+        column = east / request.metres_per_cell + (cols - 1) / 2.0
+        row = (rows - 1) / 2.0 - north / request.metres_per_cell
+        return list(zip(column.tolist(), row.tolist()))
+
+    def clipped_midpoint(x0, y0, x1, y1):
+        """Midpoint of the part of a segment visible on the grid."""
+        dx, dy = x1 - x0, y1 - y0
+        low, high = 0.0, 1.0
+        for p, q in ((-dx, x0), (dx, cols - 1 - x0),
+                     (-dy, y0), (dy, rows - 1 - y0)):
+            if abs(p) < 1e-12:
+                if q < 0:
+                    return None
+                continue
+            ratio = q / p
+            if p < 0:
+                low = max(low, ratio)
+            else:
+                high = min(high, ratio)
+            if low > high:
+                return None
+        middle = (low + high) / 2.0
+        return (x0 + middle * dx, y0 + middle * dy,
+                (high - low) * math.hypot(dx, dy))
+
+    for coastline in coastlines:
+        points = to_pixels(coastline)
+        if len(points) < 2:
+            continue
+        draw.line(points, fill=1, width=1)
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            visible = clipped_midpoint(x0, y0, x1, y1)
+            length = math.hypot(x1 - x0, y1 - y0)
+            if visible is None or length < 1e-9:
+                continue
+            x, y, visible_length = visible
+            # With screen coordinates (y grows down), (-dy, dx) is the
+            # right-hand normal -- the sea side of an OSM coastline.
+            nx = -(y1 - y0) / length
+            ny = (x1 - x0) / length
+            side_samples.append((
+                (int(round(y + ny)), int(round(x + nx))),
+                (int(round(y - ny)), int(round(x - nx))),
+                visible_length,
+            ))
+
+    if not side_samples:
+        return np.zeros((rows, cols), dtype=bool)
+
+    barrier = np.array(barrier_image, dtype=bool)
+    components, count = label_water_bodies(~barrier)
+    scores = np.zeros(count + 1, dtype=np.float64)
+    for right, left, weight in side_samples:
+        for (row, col), sign in ((right, 1.0), (left, -1.0)):
+            if (0 <= row < rows and 0 <= col < cols
+                    and not barrier[row, col]):
+                scores[components[row, col]] += sign * weight
+
+    # A tight harbour turn can put an individual rounded sample on the wrong
+    # side. Classifying whole connected components by the accumulated
+    # right-versus-left coastline length prevents that one sample from
+    # flooding the entire land mass.
+    tolerance = max(1e-6, sum(sample[2] for sample in side_samples) * 1e-9)
+    return scores[components] > tolerance
 
 
 def label_water_bodies(mask):
