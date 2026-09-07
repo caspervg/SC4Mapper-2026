@@ -4,8 +4,10 @@
 
 import os
 import os.path
+import queue
 import struct
 import sys
+import threading
 import uuid
 import zlib
 
@@ -1869,50 +1871,87 @@ class OverView(wx.Frame):
             style=(wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT
                    | wx.PD_ELAPSED_TIME))
 
+        updates = queue.SimpleQueue()
+        cancelled = threading.Event()
+        outcome = {}
+
         def report(done, total, message):
+            if cancelled.is_set():
+                raise ImportCancelled()
             percent = int(done * 100 / total) if total else 0
-            response = progress.Update(min(percent, 99), message)
-            wx.Yield()
+            updates.put((min(percent, 99), message))
+
+        def import_worker():
+            try:
+                waterMask = None
+                if request.water_source != "elevation":
+                    water = geo.OverpassClient(
+                        cache_dir=(os.path.join(cacheDir, "osm")
+                                   if cacheDir else None),
+                        timeout=30,
+                        mirrors=self.settings.overpass_endpoints() or None)
+                    waterMask = geo.fetch_water_mask(request, water, report)
+                fetcher = geo.HttpTileFetcher(
+                    url_template=elevationUrl,
+                    cache_dir=(os.path.join(cacheDir, "elevation")
+                               if cacheDir else None),
+                    attribution=(getattr(
+                        self.settings, "elevation_attribution", "") or None))
+                result = geo.build_region_grid(
+                    request, fetcher, report, water_mask=waterMask)
+                basemap = None
+                if wantUnderlay:
+                    report(0, 100, "Downloading the map underlay")
+                    mapFetcher = geo.HttpTileFetcher(
+                        url_template=self.settings.basemap_url,
+                        cache_dir=(os.path.join(cacheDir, "basemap")
+                                   if cacheDir else None),
+                        attribution=(getattr(
+                            self.settings, "basemap_attribution", "") or None))
+                    basemap, _, _, _ = geo.sample_basemap(
+                        request, mapFetcher, report)
+                outcome["result"] = result
+                outcome["basemap"] = basemap
+            except Exception as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=import_worker, daemon=True)
+        worker.start()
+        latest = (0, "Contacting the elevation server")
+        while worker.is_alive():
+            changed = False
+            try:
+                while True:
+                    latest = updates.get_nowait()
+                    changed = True
+            except queue.Empty:
+                pass
+            if changed:
+                response = progress.Update(latest[0], latest[1])
+            else:
+                response = progress.Pulse(latest[1])
             keepGoing = response[0] if isinstance(response, tuple) else response
             if not keepGoing:
-                raise ImportCancelled()
+                cancelled.set()
+                progress.Destroy()
+                return
+            wx.YieldIfNeeded()
+            worker.join(0.05)
+        progress.Destroy()
 
-        basemap = None
-        try:
-            waterMask = None
-            if request.water_source != "elevation":
-                water = geo.OverpassClient(
-                    cache_dir=os.path.join(cacheDir, "osm") if cacheDir else None,
-                    mirrors=self.settings.overpass_endpoints() or None)
-                waterMask = geo.fetch_water_mask(request, water, report)
-            fetcher = geo.HttpTileFetcher(
-                url_template=elevationUrl,
-                cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None,
-                attribution=(getattr(self.settings, "elevation_attribution", "")
-                             or None))
-            result = geo.build_region_grid(request, fetcher, report,
-                                           water_mask=waterMask)
-            if wantUnderlay:
-                report(0, 100, "Downloading the map underlay")
-                mapFetcher = geo.HttpTileFetcher(
-                    url_template=self.settings.basemap_url,
-                    cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None,
-                    attribution=(getattr(self.settings, "basemap_attribution", "")
-                                 or None))
-                basemap, _, _, _ = geo.sample_basemap(request, mapFetcher, report)
-        except ImportCancelled:
-            progress.Destroy()
+        error = outcome.get("error")
+        if isinstance(error, ImportCancelled):
             return
-        except geo.GeoImportError as exc:
-            progress.Destroy()
-            wx.MessageBox(str(exc), "Import failed", wx.OK | wx.ICON_ERROR, self)
+        if isinstance(error, geo.GeoImportError):
+            wx.MessageBox(str(error), "Import failed",
+                          wx.OK | wx.ICON_ERROR, self)
             return
-        except Exception as exc:
-            progress.Destroy()
-            wx.MessageBox("Unexpected problem while importing: %s" % exc,
+        if error is not None:
+            wx.MessageBox("Unexpected problem while importing: %s" % error,
                           "Import failed", wx.OK | wx.ICON_ERROR, self)
             return
-        progress.Destroy()
+        result = outcome["result"]
+        basemap = outcome["basemap"]
 
         config = geo.build_config_image((request.tiles_x, request.tiles_y),
                                         citySize)
