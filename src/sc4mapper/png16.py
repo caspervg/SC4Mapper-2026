@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 # Pillow mode strings used for 16-bit unsigned grayscale.
-PNG16_MODES = ("I", "I;16", "I;16L", "I;16B", "I;16N")
+PNG16_MODES = ("I", "I;16", "I;16L", "I;16B")
 
 
 def is_16bit_grayscale(im: Image.Image) -> bool:
@@ -32,7 +32,7 @@ def as_mode_i(im: Image.Image) -> Image.Image:
 
 def to_uint16_array(im: Image.Image) -> np.ndarray:
     """Convert a 16-bit grayscale PIL image to a ``uint16`` ``(H, W)`` array."""
-    if im.mode in ("I;16", "I;16L", "I;16B", "I;16N"):
+    if im.mode in ("I;16", "I;16L", "I;16B"):
         return np.asarray(im, dtype=np.uint16)
     if im.mode == "I":
         return np.clip(np.asarray(im, dtype=np.int32), 0, 65535).astype(np.uint16)
