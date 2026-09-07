@@ -259,6 +259,8 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             0, wx.LEFT | wx.BOTTOM, 5)
         self.results = wx.ListBox(self, -1, size=(340, 90))
         findSizer.Add(self.results, 0, wx.EXPAND | wx.ALL, 3)
+        self.placeDetails = wx.StaticText(self, -1, " ")
+        findSizer.Add(self.placeDetails, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         self.lat = wx.TextCtrl(self, -1, "52.3676", size=(100, -1))
         self.lon = wx.TextCtrl(self, -1, "4.9041", size=(100, -1))
@@ -627,6 +629,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self.SetLatLon(*located)
             self.results.Clear()
             self.places = []
+            self.placeDetails.SetLabel("Coordinates entered directly")
             return
         wx.BeginBusyCursor()
         try:
@@ -642,15 +645,21 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                           wx.OK | wx.ICON_INFORMATION, self)
             return
         for place in self.places:
-            self.results.Append(place.name)
+            self.results.Append(place.label)
         self.results.SetSelection(0)
-        self.SetLatLon(self.places[0].lat, self.places[0].lon)
+        self.SelectPlace(0)
 
     def OnPickPlace(self, event):
         index = self.results.GetSelection()
         if 0 <= index < len(self.places):
-            place = self.places[index]
-            self.SetLatLon(place.lat, place.lon)
+            self.SelectPlace(index)
+
+    def SelectPlace(self, index):
+        place = self.places[index]
+        self.SetLatLon(place.lat, place.lon)
+        self.placeDetails.SetLabel(place.details() or "Location point")
+        self.placeDetails.Wrap(420)
+        self.Layout()
 
     def SetLatLon(self, lat, lon):
         self.lat.SetValue("%.6f" % lat)

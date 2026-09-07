@@ -1754,6 +1754,36 @@ class Place:
     name: str
     lat: float
     lon: float
+    kind: str = ""
+    category: str = ""
+    osm_type: str = ""
+    importance: float = 0.0
+    bounding_box: Optional[tuple] = None
+
+    @property
+    def label(self):
+        """Compact result label that distinguishes administrative layers."""
+        kind = self.kind.replace("_", " ").strip()
+        if not kind:
+            return self.name
+        suffix = "%s boundary" % kind if self.category == "boundary" else kind
+        return "[%s] %s" % (suffix.title(), self.name)
+
+    def details(self):
+        """Human-readable type and approximate extent for the result."""
+        parts = []
+        kind = self.kind.replace("_", " ").strip()
+        if kind:
+            parts.append(("%s boundary" % kind
+                          if self.category == "boundary" else kind).title())
+        if self.bounding_box is not None:
+            south, north, west, east = self.bounding_box
+            width_km = abs(east - west) * float(metres_per_degree_lon(self.lat)) / 1000.0
+            height_km = abs(north - south) * metres_per_degree_lat(self.lat) / 1000.0
+            parts.append("approximately %.0f x %.0f km" % (width_km, height_km))
+        if self.osm_type:
+            parts.append("OSM %s" % self.osm_type)
+        return " - ".join(parts)
 
 
 #: Nominatim's usage policy requires an identifying User-Agent and only
@@ -1778,6 +1808,8 @@ def geocode(query, limit=8, timeout=20, user_agent=None, opener=None):
         "q": query,
         "format": "jsonv2",
         "limit": str(int(limit)),
+        "addressdetails": "1",
+        "dedupe": "1",
     })
     url = "%s?%s" % (NOMINATIM_URL, params)
     agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
@@ -1798,12 +1830,29 @@ def geocode(query, limit=8, timeout=20, user_agent=None, opener=None):
     except ValueError as exc:
         raise GeoImportError("The search service returned an unreadable reply") from exc
 
-    places = []
+    places = {}
     for item in results:
         try:
-            places.append(Place(name=item.get("display_name", "?"),
-                                lat=float(item["lat"]),
-                                lon=float(item["lon"])))
+            name = item.get("display_name", "?")
+            kind = item.get("addresstype") or item.get("type") or ""
+            raw_box = item.get("boundingbox")
+            bounding_box = None
+            if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+                bounding_box = tuple(float(value) for value in raw_box)
+            place = Place(
+                name=name,
+                lat=float(item["lat"]),
+                lon=float(item["lon"]),
+                kind=str(kind),
+                category=str(item.get("category") or ""),
+                osm_type=str(item.get("osm_type") or ""),
+                importance=float(item.get("importance") or 0.0),
+                bounding_box=bounding_box,
+            )
         except (KeyError, TypeError, ValueError):
             continue
-    return places
+        key = (name.casefold(), place.kind.casefold())
+        previous = places.get(key)
+        if previous is None or place.importance > previous.importance:
+            places[key] = place
+    return list(places.values())

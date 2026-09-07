@@ -1080,6 +1080,36 @@ def test_geocode_sends_the_query():
     assert "format=jsonv2" in seen["url"]
 
 
+def test_geocode_labels_different_administrative_extents():
+    payload = b'''[
+      {"display_name":"Gent, Belgium","lat":"51.05","lon":"3.72",
+       "category":"boundary","type":"administrative","addresstype":"city",
+       "osm_type":"relation","importance":0.69,
+       "boundingbox":["50.98","51.19","3.58","3.85"]},
+      {"display_name":"Gent, Belgium","lat":"51.06","lon":"3.64",
+       "category":"boundary","type":"administrative","addresstype":"county",
+       "osm_type":"relation","importance":0.47,
+       "boundingbox":["50.89","51.22","3.33","3.92"]}
+    ]'''
+    places = geo.geocode("Gent, Belgium", opener=lambda url: payload)
+    assert len(places) == 2
+    assert places[0].label.startswith("[City Boundary]")
+    assert places[1].label.startswith("[County Boundary]")
+    assert "approximately" in places[0].details()
+
+
+def test_geocode_collapses_same_name_and_type():
+    payload = b'''[
+      {"display_name":"Example","lat":"1","lon":"2",
+       "addresstype":"city","importance":0.3},
+      {"display_name":"Example","lat":"1.1","lon":"2.1",
+       "addresstype":"city","importance":0.8}
+    ]'''
+    places = geo.geocode("Example", opener=lambda url: payload)
+    assert len(places) == 1
+    assert places[0].lat == pytest.approx(1.1)
+
+
 # --- fetcher plumbing -----------------------------------------------------
 
 
