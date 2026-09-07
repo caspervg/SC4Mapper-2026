@@ -848,19 +848,22 @@ def build_region_grid(request, fetcher, progress=None, water_mask=None):
     water_bodies = 0
     dropped_water_bodies = 0
     if water_mask is not None and request.water_source != "elevation":
+        mapped, kept, small, high = filter_water_bodies(
+            np.asarray(water_mask, dtype=bool), height_dm,
+            sea_level_m=request.sea_level_m,
+            min_area_cells=request.min_water_area_cells,
+            max_rise_m=request.max_water_rise_m)
         if request.water_source == "both":
             # Keep what the datum already flooded -- the sea, usually --
-            # and add the mapped water on top of it.
-            effective = np.asarray(water_mask, dtype=bool) | (
+            # and add the filtered mapped water on top of it.  Filtering the
+            # union would accidentally discard small areas that the elevation
+            # datum had already flooded.
+            effective = mapped | (
                 height_dm < request.sea_level_m * 10)
         else:
             # The mask is the whole truth: anything unmapped becomes land,
             # however low it sits.
-            effective = np.asarray(water_mask, dtype=bool)
-        effective, kept, small, high = filter_water_bodies(
-            effective, height_dm, sea_level_m=request.sea_level_m,
-            min_area_cells=request.min_water_area_cells,
-            max_rise_m=request.max_water_rise_m)
+            effective = mapped
         dropped_water_bodies = small + high
         water_bodies = kept
         height_dm, water_cells, lifted_cells = apply_water_mask(

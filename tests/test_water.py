@@ -318,6 +318,21 @@ def test_both_source_keeps_the_sea_and_adds_mapped_water():
     assert result.water_fraction == pytest.approx(1.0)
 
 
+def test_both_source_does_not_filter_small_elevation_water(monkeypatch):
+    req = request(water_source="both", min_water_area_cells=64)
+    elevation = np.full(req.grid_shape, 20.0, dtype=np.float32)
+    elevation[5, 5] = -5.0
+    monkeypatch.setattr(
+        geo, "sample_elevation",
+        lambda request, fetcher, progress=None: (elevation, 10, 1, 0))
+
+    result = geo.build_region_grid(
+        req, ConstantFetcher(20.0), water_mask=np.zeros(req.grid_shape, bool))
+
+    assert result.height_dm[5, 5] < req.sea_level_m * 10
+    assert result.dropped_water_bodies == 0
+
+
 def test_mask_makes_a_lake_out_of_high_ground():
     """Interlaken in miniature: a lake 560 m up, with no datum tuning."""
     req = request(water_source="mask", water_datum_mode="lowest")
