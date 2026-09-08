@@ -600,6 +600,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         if self._closed:
             return
         self._preview_revision += 1
+        self.MarkPreviewStale()
         if self._preview_timer:
             self._preview_timer.Stop()
         # wx's macOS timer rejects a zero-millisecond timeout.  A one-ms
@@ -660,24 +661,23 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                 error = None
             except Exception as exc:
                 result, error = None, exc
-            wx.CallAfter(self._finish_preview, revision, result, error)
+            wx.CallAfter(self._finish_preview, revision, request, result, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_preview(self, revision, result, error):
+    def _finish_preview(self, revision, request, result, error):
         if self._closed:
             return
         active = self._preview_active
-        if not active:
+        if not active or active[0] != revision:
             return
-        if active[0] != revision:
-            self._preview_active = None
+        self._preview_active = None
+        if revision != self._preview_revision:
             pending = self._preview_pending
             self._preview_pending = None
             if pending and not self._closed:
                 self._start_preview(pending)
             return
-        self._preview_active = None
         if error is None and result is not None:
             image, zoom, fetched, missing, attribution = result
             wxImage = wx.Image(image.width, image.height)
@@ -689,9 +689,9 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self.previewNote.SetLabel(note)
             self.previewNote.Wrap(self.PREVIEW_SIZE[0])
             self._previewReady = True
-            self._preview_request = self.GetRequest()
+            self._preview_request = request
             self._preview_extent = geo.footprint_preview_extent(
-                self._preview_request, self.PREVIEW_SIZE)
+                request, self.PREVIEW_SIZE)
             self.Layout()
         elif not isinstance(error, ImportCancelled):
             self.previewNote.SetLabel("Preview unavailable: %s" % error)
