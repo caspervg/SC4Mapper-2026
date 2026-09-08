@@ -295,6 +295,15 @@ def test_round_trip_holds_under_rotation(rotation):
     assert back_z == pytest.approx(44, abs=1e-6)
 
 
+def test_inverse_normalizes_antimeridian_coordinates():
+    record = geo.parse_georef_record(geo.build_georef_record(
+        make_georeference(center_lat=0.0, center_lon=180.0,
+                          tiles_x=1, tiles_y=1)))
+    cell_x, cell_z = geo.georef_lonlat_to_cell(record, -180.0, 0.0)
+    assert cell_x == pytest.approx(32.0, abs=1e-5)
+    assert cell_z == pytest.approx(32.0, abs=1e-5)
+
+
 def test_round_trip_holds_at_high_latitude():
     """Where the per-row longitude scaling matters most."""
     record = geo.parse_georef_record(

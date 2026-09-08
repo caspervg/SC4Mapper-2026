@@ -920,7 +920,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             min_area = int(self._float(self.minWaterArea, "Minimum mapped area", 64.0)) if water_source != "elevation" else 64
             max_rise = self._float(self.maxWaterRise, "Maximum water rise", 30.0) if water_source != "elevation" else 30.0
             depth = self._float(self.waterDepth, "Water depth", 3.0) if water_source != "elevation" else 3.0
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise ValueError(str(exc))
         request = geo.GeoImportRequest(
             center_lat=lat, center_lon=lon, tiles_x=dimensions[0], tiles_y=dimensions[1],

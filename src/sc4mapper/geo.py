@@ -998,6 +998,8 @@ def elevation_to_height_dm(elevation_m, sea_level_m=SEA_LEVEL_M,
     sea floor for people who want it.
     """
     elevation_m = np.asarray(elevation_m, dtype=np.float64)
+    if not np.isfinite(elevation_m).all():
+        raise GeoImportError("Elevation data contains a non-finite value")
     heights = sea_level_m + (elevation_m - sea_reference_m) * vertical_scale
 
     if not keep_bathymetry:
@@ -2097,16 +2099,16 @@ def geocode(query, limit=8, timeout=20, user_agent=None, opener=None):
     url = "%s?%s" % (NOMINATIM_URL, params)
     agent = user_agent or "SC4Mapper/2026 (+https://github.com/caspervg/SC4Mapper-2026)"
 
-    if opener is not None:
-        payload = opener(url)
-    else:
-        request = urllib.request.Request(url, headers={"User-Agent": agent})
-        try:
+    try:
+        if opener is not None:
+            payload = opener(url)
+        else:
+            request = urllib.request.Request(url, headers={"User-Agent": agent})
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            raise GeoImportError("Could not reach the search service (%s)."
-                                 % getattr(exc, "reason", exc)) from exc
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        raise GeoImportError("Could not reach the search service (%s)."
+                             % getattr(exc, "reason", exc)) from exc
 
     try:
         results = json.loads(payload)

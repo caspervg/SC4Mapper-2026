@@ -22,32 +22,41 @@ less build and install friction.
 ## Real-World Locations
 
 Besides importing a heightmap, SC4Mapper can build a region directly from
-real-world elevation data. **Create Region -> Real-world location** asks for
-a place and the shape of the region to cut out of it:
+real-world elevation data. **Create Region -> Real-world location** opens one
+resizable form:
 
 ![The location dialog](doc/geo/location-dialog.jpg)
 
-- **Where** takes a place name, a coordinate pair, or a pasted OpenStreetMap
-  or Google Maps link. Place-name lookup uses OpenStreetMap's Nominatim
-  service, one search per button press.
-- **Metres per cell** is the scale. SimCity 4 cells are 16 m, so 16 is true
-  scale; larger values squeeze more real ground into the same region. The
-  dialog shows the resulting footprint in kilometres as you type.
-- **Start layout with** picks the city size to pack the region with. Whatever
-  does not fit is filled with smaller cities.
-- **Refresh preview** downloads a low-resolution, north-up context view and
-  draws the exact rotated footprint and city grid before the full import. It
-  uses the configured basemap, or an elevation hillshade when none is set.
-- **Heights** decides how elevations map onto SimCity 4's vertical axis
-  (see below).
-- Sea level is SimCity 4's 250 m datum. By default everything below the
-  real shoreline is flattened to a shallow shelf, because scaled ocean
-  bathymetry would otherwise bottom out as a pit.
+- Type a place and press **Enter** or **Find**. Pasted coordinate pairs and
+  supported OpenStreetMap, Google Maps and `geo:` links are parsed locally.
+  Place-name lookup uses OpenStreetMap's Nominatim service only after an
+  explicit search.
+- Choose **2 × 2**, **4 × 4** or **8 × 8 large-city areas**, or enter custom
+  small-tile dimensions. The default is 8 × 8 small tiles with 16 m/cell.
+  Edit **Area width** to set the footprint in kilometres; height follows the
+  tile aspect ratio. **Actual size** restores 16 m/cell.
+- The footprint preview updates automatically in the background. It is a
+  north-up footprint and city-layout preview only; water and height choices
+  are applied during import. With no configured basemap it uses elevation
+  hillshade.
+- **Water** offers Sea level, Dry land, Lake / custom level and Mapped water
+  only. Expand **Advanced settings** for mapped-water plus elevation, numeric
+  filters, rotation, height mapping, bathymetry, underlay and other expert
+  settings. Click a ready preview to recenter it, or use Edit coordinates.
+- A successful import leaves a compact summary in the overview. **Details…**
+  shows warnings and attribution; **Adjust import…** reopens the saved
+  settings in this form. It regenerates the imported terrain and initial city
+  layout, so later layout edits are confirmed before replacement.
 
 Elevation comes from the [Mapzen/AWS terrain
 tiles](https://registry.opendata.aws/terrain-tiles/): global coverage, open
 data, no API key. Tiles are cached on disk, so re-importing an area is
 offline and instant.
+
+Imports are limited to Web Mercator's approximately ±85.05° latitude coverage
+and a few million terrain vertices. A footprint that crosses the antimeridian
+is supported as a short local strip, but polar and global projection cases
+remain outside the tool's scope.
 
 ### Heights and the Vertical Axis
 
@@ -57,12 +66,12 @@ squeezed to a third of its size horizontally while elevations are
 untouched, so every slope comes out three times steeper than life. The
 **Heights** setting handles that:
 
-- **Match the horizontal scale** (default) multiplies heights by
+- **Keep natural proportions** (default) multiplies heights by
   `16 / metres_per_cell`, so hills keep the profile they have in reality
   at any import scale.
-- **Keep true elevations** leaves real metres alone. Correct at 16 m per
+- **Keep real elevation differences** leaves real metres alone. Correct at 16 m per
   cell; increasingly dramatic as you zoom out.
-- **Exaggerate by** takes a factor of your own.
+- **Custom height multiplier** takes a factor of your own.
 
 The import reports the slopes it produced, measured as the game sees them
 -- rise over the fixed 16 m cell. Roughly, grades past about 15% start to
@@ -76,8 +85,8 @@ Two other things the importer does automatically:
 
 - **Ocean depth is capped.** Scaled bathymetry reaches several kilometres
   down and would otherwise bottom out as a vast pit, so everything below
-  the shoreline is flattened to a shallow shelf. Untick *Flood everything
-  below the shoreline* to keep the real sea floor.
+  the shoreline is flattened to a shallow shelf. Untick *Flatten underwater
+  terrain* to keep the real sea floor.
 - **Artifacts are removed.** Global DEM mosaics carry occasional junk
   pixels; the tile covering the sea off Hong Kong, for instance, holds a
   handful of 5000-6000 m readings. Samples that sit more than 200 m from
@@ -132,13 +141,14 @@ with its waterways wet and its polders dry. Coastal regions such as Ostend
 also get their sea from OSM's directed coastline, so the same mask can keep
 the North Sea wet without flooding low land behind the dunes and dikes.
 
-Three settings:
+The main choices are:
 
-- **From elevation only** -- no lookup, the behaviour above.
-- **Add mapped water** -- mapped water on top of whatever the shoreline
-  already floods. Useful when elevation is a trustworthy fallback.
-- **Mapped water only** -- the map is the whole truth. Use where elevation
-  lies about water, including coastal land below sea level and polders.
+- **Sea level** -- elevation water at the real sea datum.
+- **Dry land** -- the shoreline is placed below the lowest sampled ground.
+- **Lake / custom level** -- enter the real elevation of the water surface.
+- **Mapped water only** -- OSM outlines decide water; unmapped low land is
+  raised. Advanced settings retain **Add mapped water** and all existing
+  source/datum combinations.
 
 Two filters guard against nonsense, both adjustable:
 
@@ -157,9 +167,12 @@ cached on disk afterwards, so re-importing an area is free and offline.
 Tag filters are written unquoted, because overpass-api.de currently
 answers 406 Not Acceptable to some requests carrying quoted values, and
 the request falls through to a mirror if the first endpoint refuses it.
-Coastlines are deliberately not fetched -- OSM tags them as open ways with
-land on the left rather than closed polygons, and the sea is the one case
-elevation already handles well.
+Coastline ways are fetched and rasterized separately from closed water areas;
+they are directed with land on the left, so the sea is filled on the right.
+An empty mapped-water boundary result is ambiguous for an offshore footprint
+or a region inside a large lake, and larger enclosing water can be omitted
+when other features are returned. The import warns before continuing with an
+empty mapped-water mask; elevation mode is the safer fallback.
 
 ### Laying Out City Tiles
 
@@ -258,10 +271,12 @@ tests check against the grid the importer actually sampled:
   cells local to the tile; values outside `0 .. tile.cells` mean the point
   belongs to a different city.
 
-Heights invert too, above the shoreline: `real = sea_reference_m +
-(in_game - sea_level_m) / vertical_scale`. Below it the ground was
-flattened to a shelf, so `ocean_depth_m` and `keep_bathymetry` are recorded
-to say which cells not to trust.
+For untouched above-shoreline samples, the linear mapping is
+`real = sea_reference_m + (in_game - sea_level_m) / vertical_scale`.
+It is not a guaranteed inverse for the whole import: shoreline shelves,
+mapped-water land lifting, despiking and uint16 clipping change those cells.
+`ocean_depth_m` and `keep_bathymetry` record the bathymetry choice, but they
+do not provide per-vertex provenance.
 
 `import_id` changes on every import, so a reader can cache derived data
 against it and know when a region has been re-imported underneath it.

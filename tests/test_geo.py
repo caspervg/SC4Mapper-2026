@@ -460,6 +460,11 @@ def test_vertical_scale_can_compress():
     assert heights[0, 0] == 7500  # 250 + 500 = 750 m
 
 
+def test_nonfinite_source_elevation_is_rejected():
+    with pytest.raises(geo.GeoImportError, match="non-finite"):
+        geo.elevation_to_height_dm(np.array([[float("nan")]]))
+
+
 def test_ocean_is_flattened_to_a_shelf_by_default():
     heights, _ = geo.elevation_to_height_dm(
         np.array([[-4000.0, -5.0, 0.0]]), ocean_depth_m=20.0)
@@ -815,6 +820,11 @@ def test_layout_falls_back_for_leftovers():
     assert counts[4] == 1
     assert counts[2] + counts[1] > 0
     assert counts[4] * 16 + counts[2] * 4 + counts[1] == 25
+
+
+def test_preview_layout_uses_medium_and_small_fallbacks():
+    counts = geo.describe_layout((3, 3), preferred=4)
+    assert counts == {4: 0, 2: 1, 1: 5}
 
 
 def test_layout_honours_a_smaller_preference():
