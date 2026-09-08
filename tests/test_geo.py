@@ -294,6 +294,8 @@ def test_rotation_actually_moves_the_corners():
     {"tiles_y": -1},
     {"metres_per_cell": 0.0},
     {"vertical_scale": 0.0},
+    {"vertical_scale": float("nan")},
+    {"rotation_deg": float("inf")},
 ])
 def test_invalid_requests_are_rejected(kwargs):
     with pytest.raises(geo.GeoImportError):
@@ -302,6 +304,18 @@ def test_invalid_requests_are_rejected(kwargs):
 
 def test_valid_request_passes():
     request().validate()
+
+
+def test_unreasonable_vertex_count_is_rejected_before_sampling():
+    req = request(tiles_x=999, tiles_y=999)
+    with pytest.raises(geo.GeoImportError, match="terrain vertices"):
+        req.validate()
+
+
+def test_antimeridian_inverse_uses_the_nearby_longitude():
+    east, north = geo.lonlat_to_local_offsets(0.0, 180.0, -179.999, 0.0)
+    assert east == pytest.approx(111.2, rel=0.02)
+    assert north == pytest.approx(0.0)
 
 
 # --- sampling -------------------------------------------------------------
@@ -337,6 +351,27 @@ def test_sampling_reproduces_a_known_ramp():
     # reads the ramp at p - 0.5.
     expected = fetcher.elevation_at(tx * geo.TILE_PIXELS - 0.5)
     assert np.allclose(elevation, expected, atol=0.01)
+
+
+def test_sampling_includes_bilinear_boundary_halo():
+    class StepFetcher:
+        def __init__(self):
+            self.requests = []
+
+        def fetch(self, zoom, x, y):
+            self.requests.append((zoom, x, y))
+            return x
+
+    def decode(value):
+        return np.full((geo.TILE_PIXELS, geo.TILE_PIXELS), value,
+                       dtype=np.float32)
+
+    req = request(center_lat=0.0, center_lon=0.0, zoom=1)
+    lon, lat = geo.tile_to_lonlat(1.0, 1.0, 1)
+    sampled, _, _, _ = geo._sample_tiles(
+        req, StepFetcher(), decode, None, "test",
+        sample_lonlat=(np.array([[lon]]), np.array([[lat]])))
+    assert sampled[0, 0] == pytest.approx(0.5)
 
 
 def test_ramp_increases_eastward():

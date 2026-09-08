@@ -28,6 +28,8 @@ produce, so a geographic import drops straight into ``SC4Region.height``.
 import math
 import os
 import re
+import socket
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -81,6 +83,10 @@ MERCATOR_MAX_LAT = 85.0511287798066
 
 #: Refuse to assemble a mosaic larger than this many tiles.
 MAX_MOSAIC_TILES = 512
+#: Keep one terrain grid within a few million vertices before allocating it.
+#: SC4's usual 8x8 and 16x16 regions fit comfortably; larger custom regions
+#: should be imported in smaller pieces instead of risking an OOM.
+MAX_REGION_VERTICES = 4_000_000
 
 
 class GeoImportError(Exception):
@@ -178,7 +184,9 @@ def lonlat_to_local_offsets(center_lat, center_lon, lon, lat):
              * metres_per_degree_lat(center_lat))
     m_per_deg_lon = metres_per_degree_lon(lat)
     m_per_deg_lon = np.where(np.abs(m_per_deg_lon) < 1e-6, 1e-6, m_per_deg_lon)
-    east = (np.asarray(lon, dtype=np.float64) - center_lon) * m_per_deg_lon
+    # Keep nearby points nearby when the centre is on the antimeridian.
+    delta_lon = (np.asarray(lon, dtype=np.float64) - center_lon + 180.0) % 360.0 - 180.0
+    east = delta_lon * m_per_deg_lon
     return east, north
 
 
@@ -195,6 +203,25 @@ def local_offsets_to_lonlat(center_lat, center_lon, east_m, north_m):
     m_per_deg_lon = np.where(np.abs(m_per_deg_lon) < 1e-6, 1e-6, m_per_deg_lon)
     lon = center_lon + np.asarray(east_m, dtype=np.float64) / m_per_deg_lon
     return lon, lat
+
+
+def _validate_mercator_coverage(request, extra_east_m=0.0, extra_north_m=0.0):
+    """Reject a footprint whose sampled rows leave Web Mercator coverage."""
+    width = request.tiles_x * CELLS_PER_TILE * request.metres_per_cell
+    height = request.tiles_y * CELLS_PER_TILE * request.metres_per_cell
+    half_e = width / 2.0 + extra_east_m
+    half_n = height / 2.0 + extra_north_m
+    corners_e = np.array([-half_e, half_e, half_e, -half_e])
+    corners_n = np.array([half_n, half_n, -half_n, -half_n])
+    theta = math.radians(request.rotation_deg)
+    east = corners_e * math.cos(theta) + corners_n * math.sin(theta)
+    north = -corners_e * math.sin(theta) + corners_n * math.cos(theta)
+    _, lat = local_offsets_to_lonlat(
+        request.center_lat, request.center_lon, east, north)
+    if float(np.min(lat)) < -MERCATOR_MAX_LAT or float(np.max(lat)) > MERCATOR_MAX_LAT:
+        raise GeoImportError(
+            "This footprint extends beyond Web Mercator coverage (+/-85.05 "
+            "degrees); use a lower-latitude centre or a smaller area.")
 
 
 # --- Terrarium decoding ---------------------------------------------------
@@ -292,16 +319,25 @@ class HttpTileFetcher:
                 return None
             raise GeoImportError("Elevation server returned HTTP %d for %s"
                                  % (exc.code, url)) from exc
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise GeoImportError("Could not reach the elevation server (%s). "
-                                 "Check your network connection." % exc.reason) from exc
+                                 "Check your network connection."
+                                 % getattr(exc, "reason", exc)) from exc
 
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".part"
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, path)
+            tmp = tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(path), prefix=".tile-",
+                suffix=".part", delete=False)
+            try:
+                with tmp:
+                    tmp.write(data)
+                os.replace(tmp.name, path)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except FileNotFoundError:
+                    pass
         return data
 
 
@@ -487,6 +523,24 @@ class GeoImportRequest:
         return self.vertical_scale
 
     def validate(self):
+        numeric = {
+            "latitude": self.center_lat,
+            "longitude": self.center_lon,
+            "metres per cell": self.metres_per_cell,
+            "rotation": self.rotation_deg,
+            "vertical scale": self.vertical_scale,
+            "sea level": self.sea_level_m,
+            "shoreline elevation": self.sea_reference_m,
+            "ocean depth": self.ocean_depth_m,
+            "water depth": self.water_depth_m,
+        }
+        if self.max_water_rise_m is not None:
+            numeric["maximum water rise"] = self.max_water_rise_m
+        if self.despike_threshold_m is not None:
+            numeric["despike threshold"] = self.despike_threshold_m
+        for label, value in numeric.items():
+            if not math.isfinite(float(value)):
+                raise GeoImportError("%s must be a finite number" % label.capitalize())
         if not -90.0 <= self.center_lat <= 90.0:
             raise GeoImportError("Latitude must be between -90 and 90")
         if not -180.0 <= self.center_lon <= 180.0:
@@ -495,12 +549,33 @@ class GeoImportRequest:
             raise GeoImportError(
                 "Latitude %.4f is outside the coverage of Web Mercator tiles "
                 "(+/-85.05 degrees)" % self.center_lat)
+        if (not isinstance(self.tiles_x, (int, np.integer))
+                or not isinstance(self.tiles_y, (int, np.integer))):
+            raise GeoImportError("Region dimensions must be whole numbers")
         if self.tiles_x < 1 or self.tiles_y < 1:
             raise GeoImportError("A region needs at least one tile on each side")
+        vertices = (self.tiles_x * CELLS_PER_TILE + 1) * (
+            self.tiles_y * CELLS_PER_TILE + 1)
+        if vertices > MAX_REGION_VERTICES:
+            raise GeoImportError(
+                "This region has %d terrain vertices; the limit is %d "
+                "before assembling elevation tiles. Use fewer tiles or "
+                "import smaller areas." %
+                (vertices, MAX_REGION_VERTICES))
         if self.metres_per_cell <= 0:
             raise GeoImportError("Metres per cell must be positive")
         if self.vertical_scale <= 0:
             raise GeoImportError("Vertical scale must be positive")
+        if self.ocean_depth_m < 0 or self.water_depth_m <= 0:
+            raise GeoImportError(
+                "Water depth must be positive and ocean depth non-negative")
+        if self.max_water_rise_m is not None and self.max_water_rise_m < 0:
+            raise GeoImportError("Maximum water rise cannot be negative")
+        if self.despike_threshold_m is not None and self.despike_threshold_m < 0:
+            raise GeoImportError("Despike threshold cannot be negative")
+        if (not isinstance(self.min_water_area_cells, (int, np.integer))
+                or self.min_water_area_cells < 0):
+            raise GeoImportError("Minimum water size must be a whole number")
         if self.vertical_mode not in ("match", "true", "manual"):
             raise GeoImportError(
                 "Vertical mode must be 'match', 'true' or 'manual'")
@@ -510,6 +585,7 @@ class GeoImportRequest:
         if self.water_source not in ("elevation", "mask", "both"):
             raise GeoImportError(
                 "Water source must be 'elevation', 'mask' or 'both'")
+        _validate_mercator_coverage(self)
 
     @property
     def grid_shape(self):
@@ -640,10 +716,23 @@ def _sample_tiles(request, fetcher, decode, channels, label, progress=None,
                                    max_zoom=request.max_zoom)
 
     tx, ty = lonlat_to_tile(lon, lat, zoom)
-    tile_x0 = int(math.floor(float(np.min(tx))))
-    tile_x1 = int(math.floor(float(np.max(tx))))
-    tile_y0 = int(math.floor(float(np.min(ty))))
-    tile_y1 = int(math.floor(float(np.max(ty))))
+    # Keep a dateline-crossing footprint as one short continuous strip.
+    span = 2 ** zoom
+    centre_tx, _ = lonlat_to_tile(request.center_lon, request.center_lat, zoom)
+    tx = (tx - centre_tx + span / 2.0) % span - span / 2.0 + centre_tx
+
+    # _bilinear samples around pixel centres, so the required pixel indices
+    # need a one-pixel halo at every mosaic edge.
+    pixel_x = tx * TILE_PIXELS
+    pixel_y = ty * TILE_PIXELS
+    needed_x0 = np.floor(np.min(pixel_x - 0.5))
+    needed_x1 = np.floor(np.max(pixel_x - 0.5)) + 1
+    needed_y0 = np.floor(np.min(pixel_y - 0.5))
+    needed_y1 = np.floor(np.max(pixel_y - 0.5)) + 1
+    tile_x0 = int(math.floor(needed_x0 / TILE_PIXELS))
+    tile_x1 = int(math.floor(needed_x1 / TILE_PIXELS))
+    tile_y0 = int(math.floor(needed_y0 / TILE_PIXELS))
+    tile_y1 = int(math.floor(needed_y1 / TILE_PIXELS))
 
     n_x = tile_x1 - tile_x0 + 1
     n_y = tile_y1 - tile_y0 + 1
@@ -775,6 +864,15 @@ def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
         span_n = span_e / target_aspect
     west, east = -span_e / 2.0, span_e / 2.0
     south, north = -span_n / 2.0, span_n / 2.0
+    context_e = np.array([west, east, east, west])
+    context_n = np.array([north, north, south, south])
+    _, context_lat = local_offsets_to_lonlat(
+        request.center_lat, request.center_lon, context_e, context_n)
+    if (float(np.min(context_lat)) < -MERCATOR_MAX_LAT
+            or float(np.max(context_lat)) > MERCATOR_MAX_LAT):
+        raise GeoImportError(
+            "This preview extends beyond Web Mercator coverage (+/-85.05 "
+            "degrees); use a lower-latitude centre or a smaller area.")
 
     sample_e = np.linspace(west, east, width_px, dtype=np.float64)
     sample_n = np.linspace(north, south, height_px, dtype=np.float64)
@@ -817,16 +915,22 @@ def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
         return (float(x), float(y))
 
     tile_m = CELLS_PER_TILE * request.metres_per_cell
+    layout = np.asarray(build_config_image(
+        (request.tiles_x, request.tiles_y), city_size))
     for tile_x in range(request.tiles_x + 1):
         local_e = -width_m / 2.0 + tile_x * tile_m
-        major = tile_x in (0, request.tiles_x) or tile_x % city_size == 0
+        major = (tile_x in (0, request.tiles_x)
+                 or np.any(layout[:, tile_x - 1] != layout[:, tile_x])
+                 if 0 < tile_x < request.tiles_x else True)
         draw.line([to_pixel(local_e, height_m / 2.0),
                    to_pixel(local_e, -height_m / 2.0)],
                   fill=(20, 55, 255) if major else (190, 205, 220),
                   width=3 if major else 1)
     for tile_y in range(request.tiles_y + 1):
         local_n = height_m / 2.0 - tile_y * tile_m
-        major = tile_y in (0, request.tiles_y) or tile_y % city_size == 0
+        major = (tile_y in (0, request.tiles_y)
+                 or np.any(layout[tile_y - 1] != layout[tile_y])
+                 if 0 < tile_y < request.tiles_y else True)
         draw.line([to_pixel(-width_m / 2.0, local_n),
                    to_pixel(width_m / 2.0, local_n)],
                   fill=(20, 55, 255) if major else (190, 205, 220),
@@ -957,12 +1061,21 @@ def fetch_water_mask(request, client, progress=None):
         progress(0, 1, "Looking up water from OpenStreetMap")
     query = build_water_query(region_bbox(request))
     data = client.fetch(query)
-    outers, inners = parse_overpass_water(data)
+    features = parse_overpass_water_features(data)
     coastlines = parse_overpass_coastlines(data)
     if progress is not None:
         progress(1, 1, "Tracing %d water outline(s)"
-                 % (len(outers) + len(coastlines)))
-    return (rasterize_water(request, outers, inners)
+                 % (sum(len(outers) for outers, _ in features)
+                    + len(coastlines)))
+    mask = rasterize_water(request, features=features)
+    if not features and not coastlines:
+        # Empty boundaries do not prove dry land: offshore footprints and
+        # enclosing lakes can both be absent from this local query.
+        setattr(client, "last_warning", (
+            "No mapped water boundaries were returned. This may be ambiguous "
+            "for offshore areas or large enclosing lakes; elevation water "
+            "mode is safer unless you choose to continue with an empty mask."))
+    return (mask
             | rasterize_coastlines(request, coastlines))
 
 
@@ -1064,6 +1177,7 @@ OVERPASS_MIRRORS = (
     "https://overpass.kumi.systems/api/interpreter",
 )
 OVERPASS_URL = OVERPASS_MIRRORS[0]
+OVERPASS_QUERY_TIMEOUT = 90
 
 #: Tags that describe a body of water as an *area*.
 WATER_AREA_TAGS = (
@@ -1074,12 +1188,14 @@ WATER_AREA_TAGS = (
 )
 
 
-def build_water_query(bbox, timeout=90):
+def build_water_query(bbox, timeout=OVERPASS_QUERY_TIMEOUT):
     """Overpass QL selecting water areas within ``bbox``.
 
     ``bbox`` is ``(south, west, north, east)``, the order Overpass uses.
     """
     south, west, north, east = bbox
+    west = ((west + 180.0) % 360.0) - 180.0
+    east = ((east + 180.0) % 360.0) - 180.0
     box = "%.6f,%.6f,%.6f,%.6f" % (south, west, north, east)
     clauses = []
     for key, value in WATER_AREA_TAGS:
@@ -1102,15 +1218,18 @@ def region_bbox(request, margin_cells=2):
     A small margin keeps water that laps over the edge from being clipped
     into a straight line at the boundary.
     """
+    request.validate()
     lon, lat = grid_lonlat(request)
     margin_deg_lat = (margin_cells * request.metres_per_cell
                       / metres_per_degree_lat(request.center_lat))
     margin_deg_lon = (margin_cells * request.metres_per_cell
                       / float(metres_per_degree_lon(request.center_lat)))
-    return (float(lat.min()) - margin_deg_lat,
-            float(lon.min()) - margin_deg_lon,
-            float(lat.max()) + margin_deg_lat,
-            float(lon.max()) + margin_deg_lon)
+    west = float(lon.min()) - margin_deg_lon
+    east = float(lon.max()) + margin_deg_lon
+    # Keep the two bounds in the same continuous local frame.  The query
+    # builder normalizes them to an Overpass dateline-crossing bbox.
+    return (float(lat.min()) - margin_deg_lat, west,
+            float(lat.max()) + margin_deg_lat, east)
 
 
 class OverpassClient:
@@ -1158,7 +1277,7 @@ class OverpassClient:
                 # worth asking the next one.
                 if exc.code not in (406, 429, 502, 503, 504):
                     break
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
                 problems.append("%s: %s" % (url, getattr(exc, "reason", exc)))
 
         raise GeoImportError(
@@ -1173,9 +1292,13 @@ class OverpassClient:
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
                 try:
-                    return json.load(fh)
+                    data = json.load(fh)
+                    _validate_overpass_response(data)
+                    return data
                 except ValueError:
                     pass  # a truncated cache entry; refetch below
+                except GeoImportError:
+                    pass  # stale runtime-error cache; refetch below
 
         if self.opener is not None:
             payload = self.opener(self.url, query)
@@ -1184,18 +1307,39 @@ class OverpassClient:
 
         try:
             data = json.loads(payload) if isinstance(payload, (bytes, str)) else payload
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise GeoImportError(
                 "The OpenStreetMap query service returned an unreadable reply"
             ) from exc
+        _validate_overpass_response(data)
 
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".part"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                prefix=".osm-", suffix=".part", delete=False)
+            try:
+                with tmp:
+                    json.dump(data, tmp)
+                os.replace(tmp.name, path)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except FileNotFoundError:
+                    pass
         return data
+
+
+def _validate_overpass_response(data):
+    """Reject protocol/runtime failures before they can become cached dry land."""
+    if not isinstance(data, dict) or not isinstance(data.get("elements"), list):
+        raise GeoImportError(
+            "The OpenStreetMap query service returned an invalid response")
+    remark = str(data.get("remark") or "").lower()
+    if any(word in remark for word in ("runtime error", "timed out", "timeout")):
+        raise GeoImportError(
+            "The OpenStreetMap query service reported a runtime error; "
+            "try again or choose elevation water mode.")
 
 
 def _same_ring_point(left, right, tolerance=1e-9):
@@ -1240,17 +1384,11 @@ def _assemble_rings(fragments):
     return rings
 
 
-def parse_overpass_water(data):
-    """Pull water rings out of an Overpass ``out geom`` response.
-
-    Returns ``(outers, inners)``: two lists of rings, each ring a list of
-    ``(lon, lat)``. Inner rings are the holes in multipolygons -- islands --
-    and are punched back out after the outers are filled.
-    """
-    outers = []
-    inners = []
+def parse_overpass_water_features(data):
+    """Return ``(outer_rings, inner_rings)`` per independent water feature."""
+    features = []
     if not isinstance(data, dict):
-        return outers, inners
+        return features
 
     for element in data.get("elements", []) or []:
         if not isinstance(element, dict):
@@ -1264,7 +1402,7 @@ def parse_overpass_water(data):
                     if isinstance(p, dict) and "lon" in p and "lat" in p]
             if (len(ring) >= 4
                     and _same_ring_point(ring[0], ring[-1])):
-                outers.append(ring)
+                features.append(([ring], []))
         elif kind == "relation":
             fragments = {"outer": [], "inner": []}
             for member in element.get("members", []) or []:
@@ -1277,9 +1415,22 @@ def parse_overpass_water(data):
                     continue
                 role = "inner" if member.get("role") == "inner" else "outer"
                 fragments[role].append(ring)
-            outers.extend(_assemble_rings(fragments["outer"]))
-            inners.extend(_assemble_rings(fragments["inner"]))
-    return outers, inners
+            outers = _assemble_rings(fragments["outer"])
+            inners = _assemble_rings(fragments["inner"])
+            if outers:
+                features.append((outers, inners))
+    return features
+
+
+def parse_overpass_water(data):
+    """Pull water rings out of an Overpass response.
+
+    The historical flattened return value remains for callers and tests;
+    imports use :func:`parse_overpass_water_features` to preserve ownership.
+    """
+    features = parse_overpass_water_features(data)
+    return ([ring for outers, _ in features for ring in outers],
+            [ring for _, inners in features for ring in inners])
 
 
 def parse_overpass_coastlines(data):
@@ -1305,7 +1456,8 @@ def parse_overpass_coastlines(data):
     return coastlines
 
 
-def rasterize_water(request, outers, inners=(), fetcher_shape=None):
+def rasterize_water(request, outers=(), inners=(), fetcher_shape=None,
+                    features=None):
     """Burn water rings onto the region grid.
 
     Returns a boolean array shaped like the height grid, True where water
@@ -1332,14 +1484,20 @@ def rasterize_water(request, outers, inners=(), fetcher_shape=None):
         return list(zip(column.tolist(), row.tolist()))
 
     draw = ImageDraw.Draw(canvas)
-    for ring in outers:
-        points = to_pixels(ring)
-        if len(points) >= 3:
-            draw.polygon(points, fill=1, outline=1)
-    for ring in inners:
-        points = to_pixels(ring)
-        if len(points) >= 3:
-            draw.polygon(points, fill=0, outline=0)
+    if features is None:
+        features = [([ring], []) for ring in outers]
+        # Preserve the old direct-call contract for a single flattened group.
+        if inners:
+            features = [(list(outers), list(inners))]
+    for feature_outers, feature_inners in features:
+        for ring in feature_outers:
+            points = to_pixels(ring)
+            if len(points) >= 3:
+                draw.polygon(points, fill=1, outline=1)
+        for ring in feature_inners:
+            points = to_pixels(ring)
+            if len(points) >= 3:
+                draw.polygon(points, fill=0, outline=0)
 
     return np.array(canvas, dtype=bool)
 
@@ -1936,7 +2094,7 @@ def geocode(query, limit=8, timeout=20, user_agent=None, opener=None):
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise GeoImportError("Could not reach the search service (%s)."
                                  % getattr(exc, "reason", exc)) from exc
 

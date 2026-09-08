@@ -106,6 +106,15 @@ def test_region_bbox_contains_the_whole_grid():
     assert west < lon.min() and east > lon.max()
 
 
+def test_dateline_bbox_stays_a_small_crossing_query():
+    req = request(center_lon=180.0, tiles_x=1, tiles_y=1)
+    south, west, north, east = geo.region_bbox(req)
+    query = geo.build_water_query((south, west, north, east))
+    assert "(%0.6f,%0.6f,%0.6f,%0.6f)" % (
+        south, 179.0, north, -179.0) not in query
+    assert "179." in query and "-179." in query
+
+
 # --- parsing --------------------------------------------------------------
 
 
@@ -123,6 +132,18 @@ def test_parses_a_multipolygon_with_a_hole():
         {"elements": [relation(outer, [inner])]})
     assert len(outers) == 1
     assert len(inners) == 1
+
+
+def test_water_features_keep_holes_with_their_own_owner():
+    req = request()
+    outer = square_around(req, 16)
+    island = square_around(req, 8)
+    lake = square_around(req, 3)
+    features = [([outer], [island]), ([lake], [])]
+    mask = geo.rasterize_water(req, features=features)
+    rows, cols = req.grid_shape
+    assert mask[rows // 2, cols // 2]
+    assert mask[rows // 2, cols // 2 + 10]
 
 
 def test_assembles_fragmented_multipolygon_members():
@@ -513,6 +534,24 @@ def test_fetch_water_mask_reports_progress(tmp_path):
     geo.fetch_water_mask(request(), client,
                          progress=lambda d, t, m: seen.append(m))
     assert seen
+    assert client.last_warning
+
+
+def test_runtime_error_reply_is_not_cached(tmp_path):
+    calls = []
+
+    def opener(url, query):
+        calls.append(query)
+        if len(calls) == 1:
+            return b'{"remark":"runtime error: timeout","elements":[]}'
+        return b'{"elements":[]}'
+
+    client = geo.OverpassClient(cache_dir=str(tmp_path), opener=opener)
+    query = geo.build_water_query((0, 0, 1, 1))
+    with pytest.raises(geo.GeoImportError, match="runtime error"):
+        client.fetch(query)
+    assert client.fetch(query) == {"elements": []}
+    assert len(calls) == 2
 
 
 # --- keeping unrepresentable water out ------------------------------------
@@ -674,6 +713,33 @@ def test_a_406_moves_on_to_the_next_mirror():
 
     assert len(tried) == 2
     assert tried[0] != tried[1]
+
+
+def test_raw_timeout_moves_to_the_next_mirror(monkeypatch):
+    tried = []
+
+    def fake_urlopen(request, timeout=None):
+        tried.append(request.full_url)
+        if len(tried) == 1:
+            raise TimeoutError("slow mirror")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"elements":[]}'
+
+        return Response()
+
+    import sc4mapper.geo as geomod
+    monkeypatch.setattr(geomod.urllib.request, "urlopen", fake_urlopen)
+    client = geo.OverpassClient()
+    assert client.fetch(geo.build_water_query((0, 0, 1, 1))) == {"elements": []}
+    assert len(tried) == 2
 
 
 def test_all_mirrors_failing_reports_each():
