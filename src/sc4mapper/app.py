@@ -339,6 +339,15 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         left.Add(self.waterChoice, 0, wx.EXPAND | wx.ALL, 3)
         self.waterNote = wx.StaticText(settingsPanel, label=" ")
         left.Add(self.waterNote, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        self.waterLevelPanel = wx.Panel(settingsPanel)
+        waterLevel = wx.BoxSizer(wx.HORIZONTAL)
+        waterLevel.Add(wx.StaticText(self.waterLevelPanel, label="Water level (m)"),
+                       0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.datum = wx.TextCtrl(self.waterLevelPanel, -1, "0")
+        waterLevel.Add(self.datum, 1)
+        self.waterLevelPanel.SetSizer(waterLevel)
+        self.waterLevelPanel.Hide()
+        left.Add(self.waterLevelPanel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 3)
 
         self.advanced = wx.CollapsiblePane(settingsPanel, label="Advanced settings")
         advancedPane = self.advanced.GetPane()
@@ -355,7 +364,6 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.datumMode = wx.Choice(advancedPane,
                                    choices=[label for label, _ in self.DATUM_CHOICES])
         self.datumMode.SetSelection(0)
-        self.datum = wx.TextCtrl(advancedPane, -1, "0")
         self.waterSource = wx.Choice(advancedPane,
                                      choices=[label for label, _ in self.WATER_SOURCE_CHOICES])
         self.waterSource.SetSelection(0)
@@ -374,7 +382,6 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                                ("Heights", self.verticalMode),
                                ("Custom multiplier", self.vertical),
                                ("Shoreline datum", self.datumMode),
-                               ("Water level (m)", self.datum),
                                ("Mapped water", self.waterSource),
                                ("Minimum mapped area (cells)", self.minWaterArea),
                                ("Maximum rise (m)", self.maxWaterRise),
@@ -577,6 +584,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
     def _update_controls(self):
         self.customSizePanel.Show(self.sizePreset.GetSelection() == 3)
         self.datum.Enable(self.GetDatumMode() == "manual")
+        self.waterLevelPanel.Show(self.GetDatumMode() == "manual")
         self.vertical.Enable(self.GetVerticalMode() == "manual")
         mapped = self.GetWaterSource() != "elevation"
         for control in (self.minWaterArea, self.maxWaterRise, self.waterDepth):
@@ -883,6 +891,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self._set_choice(self.datumMode, self.DATUM_CHOICES, preset[1])
             self._set_choice(self.waterSource, self.WATER_SOURCE_CHOICES, preset[2])
         self._update_controls()
+        self.Layout()
 
     def GetWaterSource(self):
         return self.WATER_SOURCE_CHOICES[max(0, self.waterSource.GetSelection())][1]
