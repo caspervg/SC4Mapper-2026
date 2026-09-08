@@ -892,6 +892,8 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         if preset[1] is not None:
             self._set_choice(self.datumMode, self.DATUM_CHOICES, preset[1])
             self._set_choice(self.waterSource, self.WATER_SOURCE_CHOICES, preset[2])
+        else:
+            self.advanced.Expand()
         self._update_controls()
         self.Layout()
 
