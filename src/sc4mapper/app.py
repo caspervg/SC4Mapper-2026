@@ -602,7 +602,9 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self._preview_revision += 1
         if self._preview_timer:
             self._preview_timer.Stop()
-        self._preview_timer = wx.CallLater(delay, self._queue_preview)
+        # wx's macOS timer rejects a zero-millisecond timeout.  A one-ms
+        # delay still gives the event loop a chance to coalesce edits.
+        self._preview_timer = wx.CallLater(max(1, int(delay)), self._queue_preview)
 
     def _queue_preview(self):
         if self._closed:
