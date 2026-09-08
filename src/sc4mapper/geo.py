@@ -829,16 +829,8 @@ def sample_basemap(request, fetcher, progress=None):
     return rgb, zoom, fetched, missing
 
 
-def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
-                            city_size=4, progress=None, margin=0.18):
-    """Build a north-up context preview with the region grid overlaid.
-
-    ``imagery`` selects regular RGB XYZ tiles.  When false, Terrarium
-    elevation tiles are converted into a lightweight hillshade, providing a
-    useful fallback when no basemap provider has been configured.
-    """
-    from PIL import ImageDraw
-
+def footprint_preview_extent(request, size=(560, 420), margin=0.18):
+    """Return the north-up local extent used by the footprint preview."""
     request.validate()
     width_px, height_px = int(size[0]), int(size[1])
     if width_px < 32 or height_px < 32:
@@ -873,6 +865,24 @@ def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
         raise GeoImportError(
             "This preview extends beyond Web Mercator coverage (+/-85.05 "
             "degrees); use a lower-latitude centre or a smaller area.")
+    return west, east, south, north, span_e, span_n, cos_t, sin_t
+
+
+def build_footprint_preview(request, fetcher, imagery=True, size=(560, 420),
+                            city_size=4, progress=None, margin=0.18):
+    """Build a north-up context preview with the region grid overlaid.
+
+    ``imagery`` selects regular RGB XYZ tiles.  When false, Terrarium
+    elevation tiles are converted into a lightweight hillshade, providing a
+    useful fallback when no basemap provider has been configured.
+    """
+    from PIL import ImageDraw
+
+    width_px, height_px = int(size[0]), int(size[1])
+    extent = footprint_preview_extent(request, size, margin)
+    west, east, south, north, span_e, span_n, cos_t, sin_t = extent
+    width_m = request.tiles_x * CELLS_PER_TILE * request.metres_per_cell
+    height_m = request.tiles_y * CELLS_PER_TILE * request.metres_per_cell
 
     sample_e = np.linspace(west, east, width_px, dtype=np.float64)
     sample_n = np.linspace(north, south, height_px, dtype=np.float64)
