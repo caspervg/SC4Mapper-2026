@@ -1,6 +1,6 @@
 [project]
 name = "sc4mapper"
-version = "2026.2a"
+version = "2026.2b"
 description = "SimCity 4 region import/export tool"
 readme = "README.md"
 requires-python = ">=3.10"
