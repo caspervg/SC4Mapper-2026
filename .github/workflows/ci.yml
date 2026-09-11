@@ -123,7 +123,7 @@ jobs:
 
       - name: Build executable (Linux)
         if: runner.os == 'Linux'
-        run: uv run pyinstaller --clean --noconfirm SC4Mapper.spec
+        run: uv run --no-sync pyinstaller --clean --noconfirm SC4Mapper.spec
 
       - name: Add user config
         run: cp -R config dist/SC4Mapper/config
