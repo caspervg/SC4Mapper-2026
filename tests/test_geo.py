@@ -4,8 +4,10 @@ Everything here runs offline: elevation tiles are synthesised in-memory and
 handed to the code through :class:`sc4mapper.geo.DictTileFetcher`.
 """
 
+import contextlib
 import io
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -434,6 +436,233 @@ def test_progress_is_reported():
                          progress=lambda done, total, msg: seen.append((done, total)))
     assert seen
     assert seen[-1][0] == seen[-1][1]
+
+
+def test_http_tiles_download_concurrently_on_the_same_grid(monkeypatch):
+    import threading
+
+    req = request(tiles_x=8, tiles_y=8, zoom=13)
+    serial = RampFetcher(origin_px=mosaic_origin_px(req, req.zoom))
+    expected = geo.sample_elevation(req, serial)
+    rendezvous = threading.Barrier(4)
+    lock = threading.Lock()
+    calls = []
+
+    def fetch(self, zoom, x, y):
+        with lock:
+            calls.append((zoom, x, y))
+            index = len(calls)
+        if index <= 4:
+            rendezvous.wait(timeout=3)
+        return serial.fetch(zoom, x, y)
+
+    monkeypatch.setattr(geo.HttpTileFetcher, "fetch", fetch)
+    actual = geo.sample_elevation(req, geo.HttpTileFetcher())
+    np.testing.assert_array_equal(actual[0], expected[0])
+    assert actual[1:] == expected[1:]
+    assert sorted(calls) == sorted(serial.requests[:len(calls)])
+
+
+def test_a_slow_tile_does_not_stall_the_ones_behind_it(monkeypatch):
+    """The pool is fed continuously, not in lockstep batches.
+
+    One tile parks until several others have gone through. That can only
+    finish if the pool keeps handing out new work while the slow tile is
+    still outstanding; a batch-at-a-time loop would deadlock here.
+    """
+    released = threading.Event()
+    lock = threading.Lock()
+    tile = constant_tile(5)
+    state = {"started": 0, "finished": 0}
+
+    def fetch(self, *coords):
+        with lock:
+            state["started"] += 1
+            first = state["started"] == 1
+        if first:
+            assert released.wait(timeout=10), "the slow tile was never released"
+        else:
+            with lock:
+                state["finished"] += 1
+                if state["finished"] >= 4:
+                    released.set()
+        return tile
+
+    monkeypatch.setattr(geo.HttpTileFetcher, "fetch", fetch)
+    fetcher = geo.HttpTileFetcher(max_workers=2)
+    elevation, _, fetched, _ = geo.sample_elevation(
+        request(tiles_x=16, tiles_y=16), fetcher)
+    assert fetched == state["started"] > 4
+
+
+def test_parallel_tile_cancellation_abandons_the_rest_of_the_mosaic(monkeypatch):
+    """A cancelled download must not keep pulling the whole mosaic.
+
+    The pool is fed continuously rather than in lockstep batches, so the
+    guarantee is a bounded window of outstanding requests, not an exact
+    count: whatever was already in flight finishes, and nothing new starts.
+    """
+    fetcher = geo.HttpTileFetcher()
+    lock = threading.Lock()
+    calls = []
+    tile = constant_tile(5)
+
+    def fetch(self, *coords):
+        with lock:
+            calls.append(coords)
+        return tile
+
+    def progress(done, total, message):
+        if done:
+            raise RuntimeError("cancelled")
+
+    # Big enough that the outstanding-request window cannot cover it.
+    req = request(tiles_x=16, tiles_y=16)
+    uncancelled = ConstantFetcher(5.0)
+    geo.sample_elevation(req, uncancelled)
+    total = len(uncancelled.requests)
+
+    monkeypatch.setattr(geo.HttpTileFetcher, "fetch", fetch)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        geo.sample_elevation(req, fetcher, progress)
+    assert 0 < len(calls) <= 2 * fetcher.max_workers
+    assert len(calls) < total
+
+
+# --- coarsening for the preview -------------------------------------------
+
+
+def test_coarsening_keeps_the_footprint_exactly():
+    fine = request(tiles_x=32, tiles_y=32, metres_per_cell=16.0)
+    coarse = geo.coarsen(fine, 420)
+    assert coarse.grid_shape < fine.grid_shape
+    assert (coarse.tiles_x * geo.CELLS_PER_TILE * coarse.metres_per_cell
+            == fine.tiles_x * geo.CELLS_PER_TILE * fine.metres_per_cell)
+    assert (coarse.tiles_y * geo.CELLS_PER_TILE * coarse.metres_per_cell
+            == fine.tiles_y * geo.CELLS_PER_TILE * fine.metres_per_cell)
+
+
+def test_coarsening_keeps_at_least_the_requested_samples():
+    fine = request(tiles_x=32, tiles_y=32)
+    coarse = geo.coarsen(fine, 420)
+    assert max(coarse.grid_shape) >= 420
+
+
+def test_coarsening_leaves_a_small_region_alone():
+    fine = request(tiles_x=4, tiles_y=4)
+    assert geo.coarsen(fine, 420) is fine
+
+
+def test_coarsening_gives_up_when_the_tile_counts_share_no_factor():
+    # 13 and 7 are coprime, so no whole-number reduction keeps the footprint.
+    fine = request(tiles_x=13, tiles_y=7)
+    assert geo.coarsen(fine, 64) is fine
+
+
+def test_coarsening_preserves_the_vertical_scale():
+    """"match" derives the scale from the cell size, which coarsening changes.
+
+    Left alone, the preview would show terrain flattened by the coarsening
+    factor -- the one thing a terrain preview must not get wrong.
+    """
+    fine = request(tiles_x=32, tiles_y=32, vertical_mode="match")
+    coarse = geo.coarsen(fine, 420)
+    assert coarse.metres_per_cell != fine.metres_per_cell
+    assert coarse.effective_vertical_scale() == fine.effective_vertical_scale()
+
+
+def test_coarsening_scales_the_minimum_water_area():
+    """A pond of n cells is fewer cells on a coarser grid.
+
+    Left alone, the size filter would quietly throw away water the user
+    asked to keep, and the preview would disagree with the import.
+    """
+    fine = request(tiles_x=32, tiles_y=32, water_source="mask",
+                   min_water_area_cells=64)
+    coarse = geo.coarsen(fine, 420)
+    factor = fine.metres_per_cell and coarse.metres_per_cell / fine.metres_per_cell
+    assert factor > 1
+    assert coarse.min_water_area_cells == round(64 / factor ** 2)
+
+
+def test_coarsening_handles_a_region_whose_tile_count_is_prime():
+    """17 has no factors to divide by, but 17ths of it are still whole."""
+    fine = request(tiles_x=17, tiles_y=17, metres_per_cell=64.0)
+    coarse = geo.coarsen(fine, 420)
+    assert max(coarse.grid_shape) < max(fine.grid_shape)
+    assert geo.tile_count(coarse) < geo.tile_count(fine)
+    assert (coarse.tiles_x * geo.CELLS_PER_TILE * coarse.metres_per_cell
+            == fine.tiles_x * geo.CELLS_PER_TILE * fine.metres_per_cell)
+
+
+def test_coarsening_keeps_the_regions_proportions():
+    fine = request(tiles_x=32, tiles_y=20)
+    coarse = geo.coarsen(fine, 420)
+    assert (coarse.tiles_x * fine.tiles_y) == (coarse.tiles_y * fine.tiles_x)
+
+
+def test_coarsening_cuts_the_tiles_a_preview_downloads():
+    fine = request(tiles_x=32, tiles_y=32, metres_per_cell=16.0)
+    detailed = ConstantFetcher(0.0)
+    draft = ConstantFetcher(0.0)
+    geo.sample_elevation(geo.coarsen(fine, 420), detailed)
+    geo.sample_elevation(geo.coarsen(fine, 96), draft)
+    full = ConstantFetcher(0.0)
+    geo.sample_elevation(fine, full)
+    assert len(draft.requests) < len(detailed.requests) < len(full.requests) / 4
+
+
+def test_a_coarse_preview_lines_up_with_the_region_it_stands_for():
+    """Same ground, same rotation, so the two agree on where things are."""
+    fine = request(tiles_x=32, tiles_y=32, rotation_deg=23.0)
+    coarse = geo.coarsen(fine, 420)
+    assert (geo.footprint_preview_extent(coarse)
+            == geo.footprint_preview_extent(fine))
+
+
+def test_a_coarse_preview_still_draws_the_real_city_grid():
+    fine = request(tiles_x=32, tiles_y=32)
+    coarse = geo.coarsen(fine, 420)
+    fetcher = ConstantFetcher(120.0)
+    full_image, _, _, _ = geo.build_footprint_preview(
+        fine, fetcher, imagery=False, size=(280, 210), city_size=4)
+    coarse_image, _, _, _ = geo.build_footprint_preview(
+        coarse, fetcher, imagery=False, size=(280, 210), city_size=4,
+        layout_request=fine)
+    blue = (20, 55, 255)
+    full_lines = int(np.count_nonzero((np.asarray(full_image) == blue).all(-1)))
+    coarse_lines = int(np.count_nonzero((np.asarray(coarse_image) == blue).all(-1)))
+    assert coarse_lines == full_lines > 0
+
+
+# --- bounded working memory -----------------------------------------------
+
+
+def test_banded_interpolation_matches_whole_grid_interpolation():
+    rng = np.random.default_rng(7)
+    source = (rng.random((300, 400)) * 100).astype(np.float32)
+    px = rng.random((900, 700)) * 399
+    py = rng.random((900, 700)) * 299
+    np.testing.assert_allclose(
+        geo._bilinear(source, px, py),
+        geo._bilinear(source, px, py, band_rows=10 ** 6),
+        rtol=1e-5, atol=1e-3)
+
+
+def test_banded_despiking_matches_whole_grid_despiking():
+    rng = np.random.default_rng(7)
+    elevation = (rng.normal(100, 40, (900, 700))).astype(np.float32)
+    elevation[400, 300] = 9000.0
+    elevation[899, 0] = -9000.0
+    banded, banded_count = geo.despike_elevation(elevation, 200.0, band_rows=64)
+    whole, whole_count = geo.despike_elevation(elevation, 200.0, band_rows=10 ** 6)
+    np.testing.assert_array_equal(banded, whole)
+    assert banded_count == whole_count >= 2
+
+
+def test_a_region_of_large_city_tiles_is_allowed():
+    """8x8 large city tiles. Rejecting it was a working-memory limit."""
+    request(tiles_x=32, tiles_y=32).validate()
 
 
 # --- height mapping -------------------------------------------------------
@@ -1043,6 +1272,42 @@ def test_footprint_preview_can_fall_back_to_elevation():
     assert fetched > 0
 
 
+@pytest.mark.parametrize("rotation", [0, 37, 90])
+def test_preview_projects_finished_terrain_without_another_download(rotation):
+    req = request(tiles_x=1, tiles_y=1, rotation_deg=rotation)
+    colours = np.full((*req.grid_shape, 3), (160, 180, 110), dtype=np.uint8)
+    colours[20:45, 20:45] = (30, 100, 180)  # mapped lake, independent of elevation
+    image, _, fetched, _ = geo.build_footprint_preview(
+        req, None, imagery=False, size=(240, 240), terrain_rgb=colours)
+    pixels = np.asarray(image)
+    np.testing.assert_array_equal(pixels[120, 120], (30, 100, 180))
+    assert np.any(np.all(pixels == (160, 180, 110), axis=-1))
+    assert fetched == 0
+
+
+def test_preview_draws_actual_city_boundaries_without_splitting_medium_cities():
+    req = request(tiles_x=3, tiles_y=3)
+    colours = np.full((*req.grid_shape, 3), 200, dtype=np.uint8)
+    image, *_ = geo.build_footprint_preview(
+        req, None, imagery=False, size=(301, 301), margin=0, terrain_rgb=colours)
+    pixels = np.asarray(image)
+    np.testing.assert_array_equal(pixels[100, 100], (200, 200, 200))
+    np.testing.assert_array_equal(pixels[250, 100], (20, 55, 255))
+
+
+def test_water_tuning_reuses_samples_but_changes_the_result():
+    from dataclasses import replace
+
+    req = request(water_datum_mode="manual", sea_reference_m=558)
+    samples = (np.full(req.grid_shape, 558.5), 13, 4, 0)
+    before = geo.build_region_grid(req, None, sampled_elevation=samples)
+    changed = replace(req, sea_reference_m=559)
+    after = geo.build_region_grid(changed, None, sampled_elevation=samples)
+    assert req.sampling_key == changed.sampling_key
+    assert before.water_fraction == 0 and after.water_fraction == 1
+    assert replace(req, rotation_deg=30).sampling_key != req.sampling_key
+
+
 # --- locating -------------------------------------------------------------
 
 
@@ -1163,6 +1428,229 @@ def test_dict_fetcher_records_requests():
     assert fetcher.fetch(3, 1, 2) == b"x"
     assert fetcher.fetch(3, 9, 9) is None
     assert fetcher.requests == [(3, 1, 2), (3, 9, 9)]
+
+
+# --- keep-alive tile downloads --------------------------------------------
+
+
+class TileServer:
+    """A real local HTTP server, so keep-alive behaviour is actually tested.
+
+    Records the port of every connection it accepts, which is how the tests
+    tell a reused connection from a fresh one.
+    """
+
+    def __init__(self, handler_factory):
+        import http.server
+
+        self.connections = []
+        self.paths = []
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                server.connections.append(self.client_address[1])
+                server.paths.append(self.path)
+                status, headers, body = handler_factory(self.path)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url_template(self):
+        return "http://127.0.0.1:%d/{z}/{x}/{y}.png" % self.port
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def tile_server():
+    servers = []
+
+    def start(handler_factory):
+        server = TileServer(handler_factory)
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def png_bytes(value=0):
+    buffer = io.BytesIO()
+    Image.new("RGB", (geo.TILE_PIXELS, geo.TILE_PIXELS), (value, value, value)).save(
+        buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_tiles_reuse_one_connection_per_origin(tile_server):
+    body = png_bytes()
+    server = tile_server(lambda path: (200, {"Content-Type": "image/png"}, body))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template, max_workers=1)
+    try:
+        for y in range(6):
+            assert fetcher.fetch(10, 1, y) == body
+    finally:
+        fetcher.close()
+    assert len(server.paths) == 6
+    # One handshake, not six: every request came in on the same socket.
+    assert len(set(server.connections)) == 1
+
+
+def test_parallel_tiles_open_at_most_one_connection_per_worker(tile_server):
+    body = png_bytes()
+    server = tile_server(lambda path: (200, {"Content-Type": "image/png"}, body))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template, max_workers=4)
+    req = request(tiles_x=8, tiles_y=8)
+    try:
+        _, _, fetched, _ = geo.sample_elevation(req, fetcher)
+    finally:
+        fetcher.close()
+    assert fetched == len(server.paths) > 4
+    assert len(set(server.connections)) <= 4
+
+
+def test_a_connection_closed_while_idle_is_retried(tile_server):
+    body = png_bytes()
+
+    def handler(path):
+        # Ask the client to hang up after the first tile, the way a server
+        # trimming idle keep-alive connections does.
+        if len(server.paths) == 1:
+            return 200, {"Content-Type": "image/png", "Connection": "close"}, body
+        return 200, {"Content-Type": "image/png"}, body
+
+    server = tile_server(handler)
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template, max_workers=1)
+    try:
+        assert fetcher.fetch(10, 1, 1) == body
+        assert fetcher.fetch(10, 1, 2) == body
+    finally:
+        fetcher.close()
+    assert len(server.paths) == 2
+
+
+def test_tile_redirects_are_followed(tile_server):
+    body = png_bytes()
+
+    def handler(path):
+        if path.endswith("/1.png"):
+            return 302, {"Location": "/10/1/2.png"}, b""
+        return 200, {"Content-Type": "image/png"}, body
+
+    server = tile_server(handler)
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template)
+    try:
+        assert fetcher.fetch(10, 1, 1) == body
+    finally:
+        fetcher.close()
+    assert server.paths == ["/10/1/1.png", "/10/1/2.png"]
+
+
+def test_a_redirect_loop_is_reported(tile_server):
+    server = tile_server(lambda path: (302, {"Location": path}, b""))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template)
+    try:
+        with pytest.raises(geo.GeoImportError, match="redirected more than"):
+            fetcher.fetch(10, 1, 1)
+    finally:
+        fetcher.close()
+
+
+def test_a_missing_tile_is_not_an_error(tile_server):
+    server = tile_server(lambda path: (404, {}, b"gone"))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template)
+    try:
+        assert fetcher.fetch(10, 1, 1) is None
+    finally:
+        fetcher.close()
+    assert fetcher.last_missing[0] == 404
+
+
+def test_a_server_error_is_reported(tile_server):
+    server = tile_server(lambda path: (500, {}, b"boom"))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template)
+    try:
+        with pytest.raises(geo.GeoImportError, match="HTTP 500"):
+            fetcher.fetch(10, 1, 1)
+    finally:
+        fetcher.close()
+
+
+def test_a_downloaded_tile_is_cached(tile_server, tmp_path):
+    body = png_bytes()
+    server = tile_server(lambda path: (200, {"Content-Type": "image/png"}, body))
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template,
+                                  cache_dir=str(tmp_path))
+    try:
+        assert fetcher.fetch(10, 1, 1) == body
+        assert fetcher.fetch(10, 1, 1) == body
+    finally:
+        fetcher.close()
+    assert len(server.paths) == 1
+
+
+def test_an_unreachable_server_explains_itself(tile_server):
+    server = tile_server(lambda path: (200, {}, b""))
+    template = server.url_template
+    server.close()
+    fetcher = geo.HttpTileFetcher(url_template=template, timeout=2)
+    with pytest.raises(geo.GeoImportError, match="Could not reach"):
+        fetcher.fetch(10, 1, 1)
+
+
+def test_a_proxied_fetcher_falls_back_to_urllib(monkeypatch, tile_server):
+    body = png_bytes()
+    server = tile_server(lambda path: (200, {"Content-Type": "image/png"}, body))
+    monkeypatch.setattr(geo.urllib.request, "getproxies",
+                        lambda: {"http": "http://proxy.invalid:3128"})
+    monkeypatch.setattr(geo.urllib.request, "proxy_bypass", lambda host: False)
+    fetcher = geo.HttpTileFetcher(url_template=server.url_template)
+    assert fetcher._proxy_for(server.url_template.format(z=1, x=1, y=1, s="", l="m"))
+
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        return contextlib.closing(FakeResponse(200, body))
+
+    monkeypatch.setattr(geo.urllib.request, "urlopen", fake_urlopen)
+    assert fetcher.fetch(10, 1, 1) == body
+    assert seen and not server.paths
+
+
+class FakeResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def test_http_fetcher_uses_the_cache(tmp_path):

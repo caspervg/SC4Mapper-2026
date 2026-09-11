@@ -8,6 +8,7 @@ import queue
 import struct
 import sys
 import threading
+import time
 import uuid
 import zlib
 
@@ -222,6 +223,14 @@ class CreateRgnFromLocationDialog(wx.Dialog):
     """Compact location picker with one canonical request and async preview."""
 
     PREVIEW_SIZE = (560, 420)
+    #: Terrain samples along the preview's longest edge. The footprint fills
+    #: about three quarters of the image, so finer sampling than this only
+    #: buys detail that is averaged away on the way to the screen -- while
+    #: costing tiles by the square of the sample density.
+    PREVIEW_SAMPLES = 420
+    #: Show the bare context map first when the terrain pass needs more
+    #: source tiles than this, so a long wait is not a blank rectangle.
+    PREVIEW_DRAFT_TILES = 24
     SIZE_CHOICES = [("2 × 2 large-city areas", (8, 8)),
                     ("4 × 4 large-city areas", (16, 16)),
                     ("8 × 8 large-city areas", (32, 32)),
@@ -232,14 +241,14 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                         ("Keep real elevation differences", "true"),
                         ("Custom height multiplier", "manual")]
     DATUM_CHOICES = [("Sea level", "sea"), ("Dry land", "lowest"),
-                     ("Custom level", "manual")]
+                     ("Custom level", "manual"), ("Automatic mapped level", "mapped")]
     WATER_SOURCE_CHOICES = [("Elevation", "elevation"),
                             ("Mapped water + elevation", "both"),
                             ("Mapped water only", "mask")]
     WATER_CHOICES = [("Sea level", "sea", "elevation"),
                      ("Dry land", "lowest", "elevation"),
                      ("Lake / custom level", "manual", "elevation"),
-                     ("Mapped water only", "manual", "mask"),
+                     ("Mapped water only", "mapped", "mask"),
                      ("Custom…", None, None)]
 
     def __init__(self, parent, settings, state=None):
@@ -258,11 +267,27 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self._preview_timer = None
         self._previewReady = False
         self._preview_request = None
+        self._preview_result = None
+        self._preview_water_warning = None
+        self._preview_sample_key = None
+        self._preview_elevation = {}
+        self._preview_mask = {}
+        self._preview_outlines = None
+        self._preview_mask_warning = None
+        self._preview_has_ocean = False
+        self._slider_sample_key = None
         self._preview_extent = None
         self._preview_image_size = self.PREVIEW_SIZE
+        cache_dir = getattr(settings, "tile_cache_dir", "") or None
+        self._fetchers = {}
+        self._preview_water = geo.OverpassClient(
+            cache_dir=os.path.join(cache_dir, "osm") if cache_dir else None,
+            timeout=105, mirrors=settings.overpass_endpoints() or None)
 
         settingsPanel = wx.ScrolledWindow(self, style=wx.VSCROLL)
         settingsPanel.SetScrollRate(0, 10)
+        settingsPanel.SetMinSize((380, -1))
+        settingsPanel.SetMaxSize((380, -1))
         left = wx.BoxSizer(wx.VERTICAL)
 
         searchRow = wx.BoxSizer(wx.HORIZONTAL)
@@ -274,14 +299,18 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         left.Add(wx.StaticText(settingsPanel, label="Place or coordinates"),
                  0, wx.LEFT | wx.TOP, 5)
         left.Add(searchRow, 0, wx.EXPAND)
-        left.Add(wx.StaticText(
+        searchHint = wx.StaticText(
             settingsPanel, label="Paste a coordinate pair or supported map link; "
-            "place names use OpenStreetMap search."), 0, wx.LEFT | wx.BOTTOM, 5)
+            "place names use OpenStreetMap search.")
+        searchHint.Wrap(365)
+        left.Add(searchHint, 0, wx.LEFT | wx.BOTTOM, 5)
         self.results = wx.ListBox(settingsPanel, -1)
+        self.results.SetMinSize((1, 110))  # list contents must not set panel width
         self.results.Hide()
         left.Add(self.results, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 3)
         self.placeDetails = wx.StaticText(
             settingsPanel, label="Amsterdam, Netherlands · 52.367600, 4.904100")
+        self.placeDetails.Wrap(365)
         left.Add(self.placeDetails, 0, wx.EXPAND | wx.ALL, 5)
         self.editCoordinates = wx.Button(settingsPanel, -1, "Edit coordinates")
         left.Add(self.editCoordinates, 0, wx.LEFT | wx.BOTTOM, 3)
@@ -340,11 +369,26 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.waterNote = wx.StaticText(settingsPanel, label=" ")
         left.Add(self.waterNote, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.waterLevelPanel = wx.Panel(settingsPanel)
-        waterLevel = wx.BoxSizer(wx.HORIZONTAL)
-        waterLevel.Add(wx.StaticText(self.waterLevelPanel, label="Water level (m)"),
+        waterLevel = wx.BoxSizer(wx.VERTICAL)
+        waterValue = wx.BoxSizer(wx.HORIZONTAL)
+        waterValue.Add(wx.StaticText(self.waterLevelPanel, label="Water level (real m)"),
                        0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         self.datum = wx.TextCtrl(self.waterLevelPanel, -1, "0")
-        waterLevel.Add(self.datum, 1)
+        self.datum.SetToolTip(
+            "The app chooses sea level for mapped coasts or estimates the "
+            "main lake's surface elevation. Adjust here to fine-tune it.")
+        waterValue.Add(self.datum, 1)
+        self.waterAuto = wx.Button(self.waterLevelPanel, label="Auto")
+        waterValue.Add(self.waterAuto, 0, wx.LEFT, 4)
+        waterLevel.Add(waterValue, 0, wx.EXPAND)
+        self.waterSlider = wx.Slider(self.waterLevelPanel, value=0,
+                                     minValue=-100, maxValue=100)
+        self.waterSlider.SetToolTip(
+            "Adjust the real elevation that becomes SC4's waterline. "
+            "Use the arrow keys for 0.1 m steps, or type an exact value above.")
+        self.waterSlider.SetLineSize(1)
+        self.waterSlider.Enable(False)
+        waterLevel.Add(self.waterSlider, 0, wx.EXPAND | wx.TOP, 3)
         self.waterLevelPanel.SetSizer(waterLevel)
         self.waterLevelPanel.Hide()
         left.Add(self.waterLevelPanel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 3)
@@ -405,8 +449,8 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.previewBitmap = wx.StaticBitmap(self, bitmap=wx.Bitmap(blank))
         self.btnPreview = wx.Button(self, -1, "Refresh / Retry")
         self.previewNote = wx.StaticText(
-            self, label="Footprint only; water and height settings apply during import.")
-        previewBox = wx.StaticBox(self, -1, "Footprint preview")
+            self, label="Terrain and water preview updates as you adjust the settings.")
+        previewBox = wx.StaticBox(self, -1, "Region preview")
         previewSizer = wx.StaticBoxSizer(previewBox, wx.VERTICAL)
         previewSizer.Add(self.previewBitmap, 1, wx.EXPAND | wx.ALL, 5)
         previewSizer.Add(self.btnPreview, 0, wx.ALIGN_LEFT | wx.ALL, 5)
@@ -447,8 +491,16 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.verticalMode.Bind(wx.EVT_CHOICE, self.OnAdvancedChanged)
         self.datumMode.Bind(wx.EVT_CHOICE, self.OnAdvancedChanged)
         self.waterSource.Bind(wx.EVT_CHOICE, self.OnAdvancedChanged)
+        for control in (self.vertical, self.minWaterArea,
+                        self.maxWaterRise, self.waterDepth):
+            control.Bind(wx.EVT_TEXT, self.OnAdvancedChanged)
+        self.flatten.Bind(wx.EVT_CHECKBOX, self.OnAdvancedChanged)
+        self.underlay.Bind(wx.EVT_CHECKBOX, self.OnAdvancedChanged)
         self.advanced.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, self.OnAdvancedPane)
         self.waterChoice.Bind(wx.EVT_CHOICE, self.OnWaterPreset)
+        self.waterSlider.Bind(wx.EVT_SLIDER, self.OnWaterSlider)
+        self.waterAuto.Bind(wx.EVT_BUTTON, self.OnWaterAuto)
+        self.datum.Bind(wx.EVT_TEXT, self.OnWaterDatum)
         self.btnPreview.Bind(wx.EVT_BUTTON, self.OnPreview)
         self.previewBitmap.Bind(wx.EVT_LEFT_UP, self.OnPreviewClick)
         self.btnOk.Bind(wx.EVT_BUTTON, self.OnImport)
@@ -492,7 +544,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.rotation.SetValue(str(request.rotation_deg))
         self.metres.SetValue(str(request.metres_per_cell))
         self.vertical.SetValue(str(request.vertical_scale))
-        self.datum.SetValue(str(request.sea_reference_m))
+        self.datum.ChangeValue(str(request.sea_reference_m))
         self.minWaterArea.SetValue(str(request.min_water_area_cells))
         self.maxWaterRise.SetValue(str(request.max_water_rise_m))
         self.waterDepth.SetValue(str(request.water_depth_m))
@@ -583,25 +635,27 @@ class CreateRgnFromLocationDialog(wx.Dialog):
 
     def _update_controls(self):
         self.customSizePanel.Show(self.sizePreset.GetSelection() == 3)
-        self.datum.Enable(self.GetDatumMode() == "manual")
-        self.waterLevelPanel.Show(self.GetDatumMode() == "manual")
+        self.datum.Enable(self.GetDatumMode() != "lowest")
+        self.waterLevelPanel.Show(self.GetDatumMode() != "lowest")
         self.vertical.Enable(self.GetVerticalMode() == "manual")
         mapped = self.GetWaterSource() != "elevation"
         for control in (self.minWaterArea, self.maxWaterRise, self.waterDepth):
             control.Enable(mapped)
         notes = {
-            "elevation": "Sea level uses elevation; inland lakes need a custom level.",
-            "both": "Mapped water is added to elevation flooding.",
-            "mask": "Only mapped water is wet; low unmapped ground is raised.",
+            "elevation": "Sea level can flood polders; use mapped water.\nInland lakes need a custom level.",
+            "both": "Adds mapped water to elevation flooding.\nBelow-sea-level polders still flood.",
+            "mask": "Water level is chosen from the coast or main lake.\nUse the slider to fine-tune; low land stays dry.",
         }
         self.waterNote.SetLabel(notes[self.GetWaterSource()])
 
-    def _schedule_preview(self, delay=500):
+    def _schedule_preview(self, delay=500, throttle=False):
         if self._closed:
             return
         self._preview_revision += 1
         self.MarkPreviewStale()
         if self._preview_timer:
+            if throttle and self._preview_timer.IsRunning():
+                return
             self._preview_timer.Stop()
         # wx's macOS timer rejects a zero-millisecond timeout.  A one-ms
         # delay still gives the event loop a chance to coalesce edits.
@@ -612,58 +666,189 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             return
         try:
             request = self.GetRequest()
-        except ValueError:
+        except ValueError as exc:
+            # Saying nothing here leaves the note reading "Updating preview…"
+            # for a preview that is never coming, which is how an unbuildable
+            # region -- one too large, say -- used to look like a hang.
+            self.previewNote.SetLabel("Preview unavailable: %s" % exc)
+            self.previewNote.Wrap(self.PREVIEW_SIZE[0])
+            self._previewReady = False
+            self.Layout()
             return
         snapshot = (self._preview_revision, request, self.GetCitySize())
         self.MarkPreviewStale()
         if self._preview_active:
             self._preview_pending = snapshot
-            self._preview_active[1].set()
+            if self._preview_active[2] != request.sampling_key:
+                self._preview_active[1].set()
             return
         self._start_preview(snapshot)
 
-    def _make_preview_fetcher(self):
+    def _tile_fetcher(self, kind):
+        """A fetcher for ``kind``, kept for the life of the dialog.
+
+        Reusing the instance is what makes its keep-alive connections worth
+        having: a preview that rebuilt the fetcher on every edit would pay a
+        fresh handshake for every tile of every refresh.
+        """
+        cached = self._fetchers.get(kind)
+        if cached is not None:
+            return cached
         cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
-        basemap = getattr(self.settings, "basemap_url", "").strip()
-        if basemap:
-            return (geo.HttpTileFetcher(
-                url_template=basemap,
-                cache_dir=os.path.join(cacheDir, "basemap") if cacheDir else None,
-                timeout=12,
-                attribution=getattr(self.settings, "basemap_attribution", "") or None),
-                    True, getattr(self.settings, "basemap_attribution", "")
-                    or "Map preview: %s" % basemap)
-        elevation = getattr(self.settings, "elevation_url", "") or geo.DEFAULT_TILE_URL
-        return (geo.HttpTileFetcher(
-            url_template=elevation,
-            cache_dir=os.path.join(cacheDir, "elevation") if cacheDir else None,
-            timeout=12,
-            attribution=getattr(self.settings, "elevation_attribution", "") or None),
-                False, "Elevation hillshade preview")
+        if kind == "basemap":
+            url = getattr(self.settings, "basemap_url", "").strip()
+            attribution = getattr(self.settings, "basemap_attribution", "") or None
+        else:
+            url = getattr(self.settings, "elevation_url", "") or geo.DEFAULT_TILE_URL
+            attribution = getattr(self.settings, "elevation_attribution", "") or None
+        fetcher = geo.HttpTileFetcher(
+            url_template=url,
+            cache_dir=os.path.join(cacheDir, kind) if cacheDir else None,
+            timeout=12, attribution=attribution)
+        self._fetchers[kind] = fetcher
+        return fetcher
+
+    def _make_preview_fetcher(self):
+        if getattr(self.settings, "basemap_url", "").strip():
+            return self._tile_fetcher("basemap"), True
+        return self._tile_fetcher("elevation"), False
+
+    def _close_fetchers(self):
+        for fetcher in self._fetchers.values():
+            fetcher.close()
+        self._fetchers.clear()
+
+    def _wants_draft(self, sampled, querying_water):
+        """Whether to put the bare context map up before the terrain.
+
+        Only when the terrain pass is a real wait: a lot of source tiles, or
+        an OpenStreetMap water query, which takes seconds on its own. The
+        draft draws the same context tiles that pass needs anyway, so where
+        it is worth doing it costs a redraw and buys the map, the footprint
+        and the city grid several seconds early.
+        """
+        if querying_water:
+            return True
+        try:
+            return geo.tile_count(sampled) > self.PREVIEW_DRAFT_TILES
+        except geo.GeoImportError:
+            # Over the mosaic limit. Let the terrain pass raise instead, with
+            # its own message about what to change.
+            return False
 
     def _start_preview(self, snapshot):
         revision, request, city_size = snapshot
         cancel = threading.Event()
-        self._preview_active = (revision, cancel)
-        fetcher, imagery, attribution = self._make_preview_fetcher()
+        self._preview_active = (revision, cancel, request.sampling_key)
+        fetcher, imagery = self._make_preview_fetcher()
+        elevation_fetcher = self._tile_fetcher("elevation")
+        opacity = self.settings.basemap_opacity if self.WantsUnderlay() else 0.0
+        sampled = geo.coarsen(request, self.PREVIEW_SAMPLES)
         self.previewNote.SetLabel("Updating preview…")
+        announced = {"message": None, "at": 0.0}
 
         def progress(done, total, message):
             if cancel.is_set():
                 raise ImportCancelled()
+            # Say what is happening, but not faster than anyone can read.
+            now = time.monotonic()
+            if message != announced["message"] and now - announced["at"] > 0.15:
+                announced["message"] = message
+                announced["at"] = now
+                wx.CallAfter(self._show_preview_progress, revision, message)
+
+        def draw_context(terrain_rgb=None):
+            """The north-up context map with the city grid over it."""
+            image, _, _, _ = geo.build_footprint_preview(
+                sampled, fetcher, imagery=imagery, size=self.PREVIEW_SIZE,
+                city_size=city_size, progress=progress,
+                terrain_rgb=terrain_rgb, basemap_opacity=opacity,
+                layout_request=request)
+            return image
+
+        def render(scaled):
+            """One complete pass: sample, convert, colour, draw."""
+            shape = scaled.grid_shape
+            water_mask = None
+            warning = None
+            if scaled.water_source != "elevation":
+                if shape not in self._preview_mask:
+                    self._preview_mask[shape] = geo.fetch_water_mask(
+                        scaled, self._preview_water, progress,
+                        outlines=self._preview_outlines)
+                    self._preview_mask_warning = self._preview_water.last_warning
+                    self._preview_has_ocean = self._preview_water.has_ocean
+                water_mask = self._preview_mask[shape]
+                warning = self._preview_mask_warning
+            if shape not in self._preview_elevation:
+                self._preview_elevation[shape] = geo.sample_elevation(
+                    scaled, elevation_fetcher, progress)
+            imported = geo.build_region_grid(
+                scaled, elevation_fetcher, progress, water_mask=water_mask,
+                sampled_elevation=self._preview_elevation[shape],
+                water_has_ocean=self._preview_has_ocean)
+            heights = imported.height_dm.astype(Numeric.float32) / 10
+            raw = terrain.onePassColors(
+                False, heights.shape, scaled.sea_level_m, heights,
+                gradient.paletteWater, gradient.paletteLand, Normalize((1, -5, -1)))
+            colours = Numeric.frombuffer(raw, Numeric.uint8).reshape((*heights.shape, 3))
+            progress(1, 1, "Drawing preview")
+            return draw_context(colours), imported, warning
 
         def worker():
             try:
-                image, zoom, fetched, missing = geo.build_footprint_preview(
-                    request, fetcher, imagery=imagery, size=self.PREVIEW_SIZE,
-                    city_size=city_size, progress=progress)
-                result = (image, zoom, fetched, missing, attribution)
+                key = request.sampling_key
+                if key != self._preview_sample_key:
+                    self._preview_sample_key = key
+                    self._preview_elevation = {}
+                    self._preview_mask = {}
+                    self._preview_outlines = None
+                    self._preview_mask_warning = None
+                    self._preview_has_ocean = False
+                querying_water = (request.water_source != "elevation"
+                                  and self._preview_outlines is None)
+                # Before anything slow, so a long preview starts with the
+                # map and the city grid rather than an empty rectangle.
+                if self._wants_draft(sampled, querying_water):
+                    wx.CallAfter(self._show_preview_draft, revision,
+                                 draw_context())
+                # Keep preview OSM requests serial across superseded edits.
+                # The outlines are kept as geometry rather than as a mask, so
+                # later water and height adjustments reuse one query.
+                if querying_water:
+                    self._preview_outlines = geo.fetch_water_outlines(
+                        request, self._preview_water, progress)
+                image, imported, warning = render(sampled)
+                # Only a pass on the region's own grid is the import; a
+                # coarsened one would hand back terrain at the wrong detail.
+                exact = sampled.grid_shape == request.grid_shape
+                result = (image, imported, warning, exact)
                 error = None
             except Exception as exc:
                 result, error = None, exc
             wx.CallAfter(self._finish_preview, revision, request, result, error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_preview_progress(self, revision, message):
+        """Put a running commentary in the note while a preview builds."""
+        if self._closed or revision != self._preview_revision:
+            return
+        if self._preview_active and self._preview_active[0] == revision:
+            self.previewNote.SetLabel(message)
+
+    def _show_preview_draft(self, revision, image):
+        """Show a rough pass. The detailed one is still on its way."""
+        if self._closed or revision != self._preview_revision:
+            return
+        if not self._preview_active or self._preview_active[0] != revision:
+            return
+        self._set_preview_bitmap(image)
+
+    def _set_preview_bitmap(self, image):
+        wxImage = wx.Image(image.width, image.height)
+        wxImage.SetData(image.tobytes())
+        self.previewBitmap.SetBitmap(wx.Bitmap(wxImage))
 
     def _finish_preview(self, revision, request, result, error):
         if self._closed:
@@ -672,28 +857,35 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         if not active or active[0] != revision:
             return
         self._preview_active = None
-        if revision != self._preview_revision:
-            pending = self._preview_pending
-            self._preview_pending = None
-            if pending and not self._closed:
-                self._start_preview(pending)
-            return
+        current = revision == self._preview_revision
         if error is None and result is not None:
-            image, zoom, fetched, missing, attribution = result
-            wxImage = wx.Image(image.width, image.height)
-            wxImage.SetData(image.tobytes())
-            self.previewBitmap.SetBitmap(wx.Bitmap(wxImage))
-            note = "%s · zoom %d · %d tile(s)" % (attribution, zoom, fetched)
-            if missing:
-                note += ", %d missing" % missing
+            image, imported, warning, exact = result
+            self._set_preview_bitmap(image)
+            note = "Water level %.1f m · %.0f%% water\n%s" % (
+                imported.georeference.sea_reference_m,
+                imported.water_fraction * 100, imported.attribution)
+            if request.water_datum_mode == "mapped":
+                note = "Automatic " + note[0].lower() + note[1:]
+            if not current:
+                note = "Updating… " + note
+            if getattr(self.settings, "basemap_url", ""):
+                note += "\n" + (self.settings.basemap_attribution or "Map underlay")
+            if imported.dropped_water_bodies:
+                note += "\n%d mapped water bodies filtered out; check water level and minimum area." % imported.dropped_water_bodies
+            if warning:
+                note += "\n" + warning
             self.previewNote.SetLabel(note)
             self.previewNote.Wrap(self.PREVIEW_SIZE[0])
-            self._previewReady = True
+            self._previewReady = current
             self._preview_request = request
+            self._preview_result = imported if exact else None
+            self._preview_water_warning = warning
+            if current:
+                self._update_water_slider(imported)
             self._preview_extent = geo.footprint_preview_extent(
                 request, self.PREVIEW_SIZE)
             self.Layout()
-        elif not isinstance(error, ImportCancelled):
+        elif current and not isinstance(error, ImportCancelled):
             self.previewNote.SetLabel("Preview unavailable: %s" % error)
         pending = self._preview_pending
         self._preview_pending = None
@@ -706,7 +898,46 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self.previewNote.SetLabel("Updating preview…")
 
     def OnPreview(self, event):
+        self._preview_sample_key = None
         self._schedule_preview(0)
+
+    def _update_water_slider(self, imported):
+        datum = imported.georeference.sea_reference_m
+        automatic = self.GetDatumMode() != "manual"
+        if automatic:
+            self.datum.ChangeValue("%.1f" % datum)
+        if abs(datum) > 1_000_000:
+            self.waterSlider.Enable(False)
+            return  # exact numeric entry remains available outside slider range
+        value = int(round(datum * 10))
+        if (automatic or self._slider_sample_key != self._preview_sample_key
+                or not self.waterSlider.GetMin() <= value <= self.waterSlider.GetMax()):
+            # A local tuning range stays useful beside mountains. Exact
+            # numeric entry can move it anywhere; dragging never recentres it.
+            low = min(datum - 1, max(imported.min_elevation_m - 10, datum - 25))
+            high = max(datum + 1, min(imported.max_elevation_m + 10, datum + 25))
+            self.waterSlider.SetRange(int(low * 10), int(high * 10))
+            self._slider_sample_key = self._preview_sample_key
+        self.waterSlider.SetValue(value)
+        self.waterSlider.Enable(True)
+
+    def OnWaterSlider(self, event):
+        self.datum.ChangeValue("%.1f" % (self.waterSlider.GetValue() / 10.0))
+        self._set_choice(self.datumMode, self.DATUM_CHOICES, "manual")
+        self._sync_water_preset()
+        self._update_controls()
+        self.Layout()
+        self._schedule_preview(75, throttle=True)
+
+    def OnWaterAuto(self, event):
+        mode = "sea" if self.GetWaterSource() == "elevation" else "mapped"
+        self._set_choice(self.datumMode, self.DATUM_CHOICES, mode)
+        self.OnAdvancedChanged(event)
+
+    def OnWaterDatum(self, event):
+        if not self._syncing:
+            self._set_choice(self.datumMode, self.DATUM_CHOICES, "manual")
+            self.OnAdvancedChanged(event)
 
     def OnPreviewClick(self, event):
         if not self._previewReady or not self._preview_extent:
@@ -722,7 +953,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         west, east, south, north = self._preview_extent[:4]
         east_m = west + x * (east - west)
         north_m = north - y * (north - south)
-        lat, lon = geo.local_offsets_to_lonlat(
+        lon, lat = geo.local_offsets_to_lonlat(
             self._preview_request.center_lat, self._preview_request.center_lon,
             east_m, north_m)
         self.SetLatLon(float(lat), float(lon), "Custom centre")
@@ -786,6 +1017,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                 self.results.Show()
                 self.results.SetSelection(0)
                 self.SelectPlace(0)
+            self.placeDetails.Wrap(365)
             self.Layout()
         finally:
             wx.EndBusyCursor()
@@ -807,6 +1039,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self._committed_name = name
         self.placeDetails.SetLabel(
             "%s · %.6f, %.6f" % (details or name, lat, lon))
+        self.placeDetails.Wrap(365)
 
     def SetLatLon(self, lat, lon, name=None):
         self._syncing = True
@@ -877,6 +1110,19 @@ class CreateRgnFromLocationDialog(wx.Dialog):
         self.Layout()
 
     def OnAdvancedChanged(self, event):
+        if self._syncing:
+            return
+        if self.GetDatumMode() == "mapped" and self.GetWaterSource() == "elevation":
+            self._set_choice(self.datumMode, self.DATUM_CHOICES, "sea")
+        self._sync_water_preset()
+        self._update_controls()
+        self._update_footprint()
+        self._schedule_preview()
+
+    def _sync_water_preset(self):
+        if self.GetWaterSource() == "mask":
+            self.waterChoice.SetSelection(3)
+            return
         current = (self.GetDatumMode(), self.GetWaterSource())
         for index, (_, datum, source) in enumerate(self.WATER_CHOICES):
             if (datum, source) == current:
@@ -884,8 +1130,6 @@ class CreateRgnFromLocationDialog(wx.Dialog):
                 break
         else:
             self.waterChoice.SetSelection(4)
-        self._update_controls()
-        self._update_footprint()
 
     def OnWaterPreset(self, event):
         preset = self.WATER_CHOICES[self.waterChoice.GetSelection()]
@@ -896,6 +1140,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self.advanced.Expand()
         self._update_controls()
         self.Layout()
+        self._schedule_preview()
 
     def GetWaterSource(self):
         return self.WATER_SOURCE_CHOICES[max(0, self.waterSource.GetSelection())][1]
@@ -956,6 +1201,7 @@ class CreateRgnFromLocationDialog(wx.Dialog):
             self._show_error(self.search if self._location_pending else self.metres,
                              str(exc))
             return
+        self._stop_preview()
         self.EndModal(wx.ID_OK)
 
     def GetLocationName(self):
@@ -973,14 +1219,24 @@ class CreateRgnFromLocationDialog(wx.Dialog):
     def OnCloseWindow(self, event):
         self._closed = True
         self._search_revision += 1
-        if self._preview_timer:
-            self._preview_timer.Stop()
-        if self._preview_active:
-            self._preview_active[1].set()
+        self._stop_preview()
         if self.IsModal():
             self.EndModal(wx.ID_CANCEL)
         else:
             event.Skip()
+
+    def _stop_preview(self):
+        if self._preview_timer:
+            self._preview_timer.Stop()
+        self._preview_pending = None
+        if self._preview_active:
+            self._preview_active[1].set()
+
+    def Destroy(self):
+        self._closed = True
+        self._stop_preview()
+        self._close_fetchers()
+        return super().Destroy()
 
 
 class PreferencesDialog(wx.Dialog):
@@ -2210,11 +2466,9 @@ class OverView(wx.Frame):
         citySize = dlg.GetCitySize()
         wantUnderlay = dlg.WantsUnderlay()
         placeName = dlg.GetLocationName()
+        preview_result = (dlg._preview_result if dlg._previewReady
+                          and request == dlg._preview_request else None)
         dlg.Hide()
-
-        cacheDir = getattr(self.settings, "tile_cache_dir", "") or None
-        elevationUrl = (getattr(self.settings, "elevation_url", "")
-                        or geo.DEFAULT_TILE_URL)
 
         progress = wx.ProgressDialog(
             "Importing terrain", "Contacting the elevation server",
@@ -2234,35 +2488,22 @@ class OverView(wx.Frame):
 
         def import_worker():
             try:
-                waterMask = None
-                waterWarning = None
-                if request.water_source != "elevation":
-                    water = geo.OverpassClient(
-                        cache_dir=(os.path.join(cacheDir, "osm")
-                                   if cacheDir else None),
-                        timeout=105,
-                        mirrors=self.settings.overpass_endpoints() or None)
-                    waterMask = geo.fetch_water_mask(request, water, report)
+                water = dlg._preview_water if request.water_source != "elevation" else None
+                # The dialog's fetchers are already connected and their tiles
+                # already cached from the preview, so the import reuses them.
+                fetcher = dlg._tile_fetcher("elevation")
+                if preview_result is not None:
+                    result = preview_result
+                    waterWarning = dlg._preview_water_warning
+                else:
+                    result = geo.build_region_grid(
+                        request, fetcher, report, water_client=water)
                     waterWarning = getattr(water, "last_warning", None)
-                fetcher = geo.HttpTileFetcher(
-                    url_template=elevationUrl,
-                    cache_dir=(os.path.join(cacheDir, "elevation")
-                               if cacheDir else None),
-                    attribution=(getattr(
-                        self.settings, "elevation_attribution", "") or None))
-                result = geo.build_region_grid(
-                    request, fetcher, report, water_mask=waterMask)
                 basemap = None
                 if wantUnderlay:
                     report(0, 100, "Downloading the map underlay")
-                    mapFetcher = geo.HttpTileFetcher(
-                        url_template=self.settings.basemap_url,
-                        cache_dir=(os.path.join(cacheDir, "basemap")
-                                   if cacheDir else None),
-                        attribution=(getattr(
-                            self.settings, "basemap_attribution", "") or None))
                     basemap, _, _, _ = geo.sample_basemap(
-                        request, mapFetcher, report)
+                        request, dlg._tile_fetcher("basemap"), report)
                 outcome["result"] = result
                 outcome["basemap"] = basemap
                 outcome["water_warning"] = waterWarning
@@ -2312,7 +2553,7 @@ class OverView(wx.Frame):
         if outcome.get("water_warning") and request.water_source == "mask":
             dlg.Show()
             answer = wx.MessageBox(
-                outcome["water_warning"] + "\n\nContinue with the empty "
+                outcome["water_warning"] + "\n\nContinue with this "
                 "mapped-water mask?", "Mapped water coverage is ambiguous",
                 wx.YES_NO | wx.ICON_WARNING, self)
             if answer != wx.YES:

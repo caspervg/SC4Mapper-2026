@@ -146,6 +146,21 @@ def test_water_features_keep_holes_with_their_own_owner():
     assert mask[rows // 2, cols // 2 + 10]
 
 
+def test_tagged_outer_way_cannot_fill_its_relations_island():
+    req = request()
+    outer, island = square_around(req, 16), square_around(req, 8)
+    duplicate = way(outer)
+    duplicate["id"] = 10  # the relation's outer member
+    pond = way(square_around(req, 3))
+    elements = [duplicate, relation(outer, [island]), pond]
+    mask = geo.rasterize_water(
+        req, features=geo.parse_overpass_water_features({"elements": elements}))
+    mid = req.grid_shape[0] // 2
+    assert mask[mid, mid]  # independent pond on the island
+    assert not mask[mid, mid + 6]  # dry island
+    assert mask[mid, mid + 12]  # surrounding water
+
+
 def test_assembles_fragmented_multipolygon_members():
     points = [(5.0, 52.0), (5.2, 52.0), (5.2, 52.2), (5.0, 52.2)]
     members = []
@@ -233,6 +248,20 @@ def test_holes_are_punched_back_out():
     assert mask[rows // 2, cols // 2 + 10]     # water around it
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_independent_water_inside_an_island_survives_feature_order(reverse):
+    req = request()
+    features = [([square_around(req, 16)], [square_around(req, 8)]),
+                ([square_around(req, 3)], [])]
+    if reverse:
+        features.reverse()
+    mask = geo.rasterize_water(req, features=features)
+    middle = req.grid_shape[0] // 2
+    assert mask[middle, middle]
+    assert not mask[middle, middle + 6]
+    assert mask[middle, middle + 12]
+
+
 def test_empty_input_gives_dry_land():
     mask = geo.rasterize_water(request(), [])
     assert not mask.any()
@@ -303,6 +332,42 @@ def test_incomplete_coastline_does_not_flood_around_its_ends():
     assert not geo.rasterize_coastlines(req, [line]).any()
 
 
+def test_incomplete_jagged_coastline_cannot_flood_polders():
+    req = request(center_lat=51.22, center_lon=2.92)
+    east = np.linspace(-300, 300, 10)
+    north = [-9, -9, 1, 19, -5, -17, -12, 27, -5, -18]
+    lon, lat = geo.local_offsets_to_lonlat(
+        req.center_lat, req.center_lon, east, north)
+    # A rounded side sample can land on the barrier. Counting its other
+    # half used to classify almost the entire connected footprint as sea.
+    assert not geo.rasterize_coastlines(req, [list(zip(lon, lat))]).any()
+
+
+@pytest.mark.parametrize("rotation", [0, 37, 90])
+def test_coastal_polders_dikes_and_locked_waterways(monkeypatch, rotation):
+    req = request(center_lat=51.22, center_lon=2.92, rotation_deg=rotation,
+                  water_source="mask", min_water_area_cells=0)
+    # A coast facing north-west, with low polder land behind its defences.
+    east = np.array([800, -800])
+    north = np.array([1000, -600])
+    lon, lat = geo.local_offsets_to_lonlat(51.22, 2.92, east, north)
+    sea = geo.rasterize_coastlines(req, [list(zip(lon, lat))])
+    water = geo.rasterize_water(req, [square_around(req, 4)])
+    mask = sea | water
+    elevation = np.full(req.grid_shape, -3.0, dtype=np.float32)
+    elevation[sea] = -8
+    elevation[water] = 0
+    elevation[-10:, -10:] = 6  # raised ground / dike, away from the sea
+    monkeypatch.setattr(geo, "sample_elevation",
+                        lambda *args: (elevation, 13, 4, 0))
+    result = geo.build_region_grid(req, None, water_mask=mask)
+    assert sea.any() and water.any() and (~mask).any()
+    np.testing.assert_array_equal(result.height_dm < 2500, mask)
+    assert (result.height_dm[(~mask) & (elevation < 0)] == 2505).all()
+    assert (result.height_dm[(~mask) & (elevation == 6)] == 2560).all()
+    assert (result.height_dm[mask] == 2470).all()
+
+
 # --- applying the mask ----------------------------------------------------
 
 
@@ -335,6 +400,19 @@ def test_lifting_can_be_switched_off():
     out, wet, lifted = geo.apply_water_mask(heights, mask, lift_land=False)
     assert lifted == 0
     assert (out == 2450).all()
+
+
+def test_unmapped_shoreline_has_a_dry_margin():
+    heights = np.array([[2499, 2500, 2501, 2505, 2510]], dtype=np.uint16)
+    out, _, lifted = geo.apply_water_mask(heights, np.zeros_like(heights, bool))
+    np.testing.assert_array_equal(out, [[2505, 2505, 2505, 2505, 2510]])
+    assert lifted == 3
+
+
+def test_sub_decimetre_water_depth_still_floods():
+    out, _, _ = geo.apply_water_mask(
+        make_heights(250), np.ones((16, 16), bool), water_depth_m=0.01)
+    assert (out < 2500).all()
 
 
 def test_deep_water_is_left_deep():
@@ -404,6 +482,39 @@ def test_both_source_keeps_the_sea_and_adds_mapped_water():
     result = geo.build_region_grid(req, ConstantFetcher(-30.0), water_mask=mask)
     # Below the datum, so the sea is still there even with an empty mask.
     assert result.water_fraction == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("water_source", ["mask", "both"])
+@pytest.mark.parametrize("keep_bathymetry", [False, True])
+def test_coastal_mapped_water_uses_depth_and_preserves_unmapped_mode(
+        monkeypatch, water_source, keep_bathymetry):
+    # Synthetic coastal profile: sea, harbour at datum, and low polder land.
+    req = request(water_source=water_source, keep_bathymetry=keep_bathymetry,
+                  water_depth_m=3, despike_threshold_m=0)
+    elevation = np.full(req.grid_shape, 0.0, dtype=np.float32)
+    elevation[:20] = -8
+    elevation[40:] = -2
+    mask = np.zeros(req.grid_shape, bool)
+    mask[:30] = True
+    monkeypatch.setattr(
+        geo, "sample_elevation",
+        lambda request, fetcher, progress=None: (elevation, 10, 1, 0))
+    result = geo.build_region_grid(req, None, water_mask=mask)
+    assert (result.height_dm[:20] == (2420 if keep_bathymetry else 2470)).all()
+    assert (result.height_dm[20:30] == 2470).all()
+    if water_source == "mask":
+        assert (result.height_dm[30:] == 2505).all()
+        assert result.water_fraction == pytest.approx(mask.mean())
+    else:
+        assert (result.height_dm[30:40] == 2500).all()
+        assert (result.height_dm[40:] == (2480 if keep_bathymetry else 2300)).all()
+        assert result.lifted_cells == 0
+
+
+@pytest.mark.parametrize("water_source", ["mask", "both"])
+def test_mapped_import_requires_a_mask(water_source):
+    with pytest.raises(geo.GeoImportError, match="requires a water mask"):
+        geo.build_region_grid(request(water_source=water_source), None)
 
 
 def test_both_source_does_not_filter_small_elevation_water(monkeypatch):
@@ -537,6 +648,16 @@ def test_fetch_water_mask_reports_progress(tmp_path):
     assert client.last_warning
 
 
+def test_unresolved_coast_warns_even_with_inland_water():
+    req = request()
+    lon, lat = geo.local_offsets_to_lonlat(52, 5, [-200, 200], [0, 0])
+    data = {"elements": [coastline(list(zip(lon, lat))),
+                         way(square_around(req, 3))]}
+    client = geo.OverpassClient(opener=lambda *_: data)
+    assert geo.fetch_water_mask(req, client).any()
+    assert "did not establish a sea area" in client.last_warning
+
+
 def test_runtime_error_reply_is_not_cached(tmp_path):
     calls = []
 
@@ -578,6 +699,104 @@ def test_labelling_joins_diagonally_separate_runs_only_when_touching():
 def test_labelling_handles_an_empty_mask():
     labels, count = geo.label_water_bodies(np.zeros((8, 8), dtype=bool))
     assert count == 0 and not labels.any()
+
+
+def test_run_labelling_and_grouped_filters_match_flood_fill():
+    # Includes split/rejoining runs, diagonal contacts, single pixels, and
+    # even-sized bodies whose median straddles the height cutoff.
+    rng = np.random.default_rng(51)
+    for density in (0, 0.2, 0.5, 0.8, 1):
+        mask = rng.random((23, 31)) < density
+        heights = rng.integers(2500, 3101, mask.shape, dtype=np.uint16)
+        seen = np.zeros_like(mask)
+        expected = np.zeros_like(mask)
+        counts = [0, 0, 0]
+        bodies = []
+        for start in zip(*np.nonzero(mask)):
+            if seen[start]:
+                continue
+            pending, body = [start], []
+            seen[start] = True
+            while pending:
+                row, col = pending.pop()
+                body.append((row, col))
+                for r, c in ((row - 1, col), (row + 1, col),
+                             (row, col - 1), (row, col + 1)):
+                    if (0 <= r < mask.shape[0] and 0 <= c < mask.shape[1]
+                            and mask[r, c] and not seen[r, c]):
+                        seen[r, c] = True
+                        pending.append((r, c))
+            indices = tuple(np.array(body).T)
+            bodies.append(indices)
+            if len(body) < 3:
+                counts[1] += 1
+            elif np.median(heights[indices]) > 2800:
+                counts[2] += 1
+            else:
+                expected[indices] = True
+                counts[0] += 1
+        labels, count = geo.label_water_bodies(mask)
+        assert count == len(bodies)
+        assert all(np.unique(labels[body]).size == 1 for body in bodies)
+        assert np.unique(labels[mask]).size == count
+        actual, *actual_counts = geo.filter_water_bodies(
+            mask, heights, min_area_cells=3, max_rise_m=30)
+        np.testing.assert_array_equal(actual, expected)
+        assert actual_counts == counts
+
+
+def test_water_lookup_overlaps_elevation_and_propagates_errors(monkeypatch):
+    import threading
+
+    rendezvous = threading.Barrier(2)
+    req = request(water_source="mask")
+
+    def sample(*args):
+        rendezvous.wait(timeout=3)
+        return np.full(req.grid_shape, -3.0), 13, 4, 0
+
+    def lookup(*args):
+        rendezvous.wait(timeout=3)
+        raise geo.GeoImportError("water service failed")
+
+    monkeypatch.setattr(geo, "sample_elevation", sample)
+    monkeypatch.setattr(geo, "fetch_water_mask", lookup)
+    with pytest.raises(geo.GeoImportError, match="water service failed"):
+        geo.build_region_grid(req, None, water_client=object())
+
+
+@pytest.mark.parametrize("surface,has_ocean,expected", [
+    (558.0, False, 558.0),  # Lake Thun: no manual datum lookup
+    (-5.0, True, 0.0),  # sea-floor samples must not set the coastal waterline
+    (-400.0, False, -400.0),  # inland water below sea level stays distinguishable
+])
+def test_automatic_mapped_level_uses_coast_or_main_lake(surface, has_ocean, expected):
+    req = request(water_source="mask", water_datum_mode="mapped")
+    elevation = np.full(req.grid_shape, surface + 12, dtype=np.float32)
+    mask = np.zeros(req.grid_shape, bool)
+    mask[10:30, 10:30] = True
+    elevation[mask] = surface
+    elevation[10, 10:15] = surface + 100  # a few DEM bank artifacts
+    mask[50:54, 50:54] = True  # smaller, higher pond must not choose the datum
+    elevation[50:54, 50:54] = surface + 200
+    before = elevation.copy()
+    result = geo.build_region_grid(
+        req, None, water_mask=mask, sampled_elevation=(elevation, 13, 4, 0),
+        water_has_ocean=has_ocean)
+    assert result.georeference.sea_reference_m == expected
+    assert (result.height_dm[11:30, 10:30] == 2470).all()
+    assert (result.height_dm[50:54, 50:54] > 2500).all()
+    assert (result.height_dm[~mask] > 2500).all()
+    np.testing.assert_array_equal(elevation, before)
+
+
+def test_empty_automatic_mask_keeps_land_dry_without_guessing_a_lake():
+    req = request(water_source="mask", water_datum_mode="mapped")
+    result = geo.build_region_grid(
+        req, None, water_mask=np.zeros(req.grid_shape, bool),
+        sampled_elevation=(np.full(req.grid_shape, 558.0), 13, 4, 0))
+    assert result.water_fraction == 0
+    assert result.georeference.sea_reference_m == 557
 
 
 def test_small_bodies_are_dropped():
@@ -780,3 +999,78 @@ def test_a_client_error_does_not_hammer_every_mirror():
     finally:
         geomod.urllib.request.urlopen = original
     assert len(tried) == 1
+
+
+def test_water_outlines_are_fetched_once_for_several_grids():
+    """A preview drawn at two resolutions must not query Overpass twice."""
+    calls = []
+
+    class Client:
+        has_ocean = False
+        last_warning = None
+
+        def fetch(self, query):
+            calls.append(query)
+            return {"elements": []}
+
+    fine = geo.GeoImportRequest(52.0, 5.0, 32, 32, water_source="mask")
+    coarse = geo.coarsen(fine, 420)
+    client = Client()
+    outlines = geo.fetch_water_outlines(fine, client)
+    fine_mask = geo.fetch_water_mask(fine, client, outlines=outlines)
+    coarse_mask = geo.fetch_water_mask(coarse, client, outlines=outlines)
+    assert len(calls) == 1
+    assert fine_mask.shape == fine.grid_shape
+    assert coarse_mask.shape == coarse.grid_shape
+
+
+def test_snapping_collapses_a_pan_into_far_fewer_queries():
+    """Nudging the centre should mostly keep asking the same question.
+
+    Snapping onto a grid cannot promise that every nudge reuses the cached
+    answer -- some land either side of a boundary -- so the claim is about
+    how many distinct queries a session of small adjustments produces.
+    """
+    def queries(snap):
+        return {geo.build_water_query(
+                    geo.region_bbox(geo.GeoImportRequest(52.0, lon, 16, 16),
+                                    snap=snap))
+                for lon in (5.0 + step * 0.0005 for step in range(40))}
+
+    assert len(queries(snap=False)) == 40
+    assert len(queries(snap=True)) <= 4
+
+
+def test_snapped_bounds_never_clip_the_region():
+    request = geo.GeoImportRequest(52.0, 5.0, 16, 16, rotation_deg=17.0)
+    south, west, north, east = geo.region_bbox(request)
+    tight = geo.region_bbox(request, snap=False)
+    assert south <= tight[0] and west <= tight[1]
+    assert north >= tight[2] and east >= tight[3]
+
+
+def test_a_gzipped_overpass_answer_is_decompressed():
+    import gzip as gziplib
+
+    payload = b'{"elements": []}'
+
+    class Response:
+        headers = {"Content-Encoding": "gzip"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return gziplib.compress(payload)
+
+    import sc4mapper.geo as geomod
+    original = geomod.urllib.request.urlopen
+    geomod.urllib.request.urlopen = lambda request, timeout=None: Response()
+    try:
+        client = geo.OverpassClient()
+        assert client.fetch(geo.build_water_query((0, 0, 1, 1))) == {"elements": []}
+    finally:
+        geomod.urllib.request.urlopen = original
